@@ -1,9 +1,9 @@
 use resolvo::{
-    utils::{Pool, VersionSet},
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
     HintDependenciesAvailable, Interner, KnownDependencies, NameId,
     Requirement as ResolvoRequirement, SolvableId, SolverCache, StringId, VersionSetId,
     VersionSetUnionId,
+    utils::{Pool, VersionSet},
 };
 use rpmrepo_metadata::{RepositoryReader, Requirement};
 use std::{collections::HashMap, fmt::Display, hash::Hash, path::Path};
@@ -15,6 +15,7 @@ pub struct RPMPackageVersion {
     pub epoch: u32,
     pub requires: Vec<Requirement>,
     pub suggests: Vec<Requirement>,
+    // provides: Vec<Requirement>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,16 +80,12 @@ impl Ord for RPMPackageVersion {
 
 impl Display for RPMPackageVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", self.package, self.version)?;
+        write!(f, "{}", self.version)?;
         if self.epoch != 0 {
             write!(f, " ({})", self.epoch)?;
         }
         Ok(())
     }
-}
-
-impl VersionSet for RPMRequirement {
-    type V = RPMPackageVersion;
 }
 
 impl RPMRequirement {
@@ -103,16 +100,10 @@ impl RPMRequirement {
             _ => None,
         }
     }
+}
 
-    fn matches(&self, candidate: &RPMPackageVersion) -> bool {
-        let cmp = self.to_cmp();
-        if cmp.is_none() || self.0.version.is_none() {
-            return true;
-        }
-
-        let v_test = self.0.version.as_deref().unwrap();
-        version_compare::compare_to(&candidate.version, v_test, cmp.unwrap()).unwrap_or(false)
-    }
+impl VersionSet for RPMRequirement {
+    type V = RPMPackageVersion;
 }
 
 #[derive(Default)]
@@ -127,8 +118,8 @@ impl RPMProvider {
     pub fn from_repodata(path: &Path, disable_suggest: bool) -> Self {
         let reader = RepositoryReader::new_from_directory(path).unwrap();
 
-        let pool: Pool<RPMRequirement> = Pool::default();
-        let mut provides_to_package: HashMap<String, Vec<SolvableId>> = HashMap::new();
+        let pool = Pool::default();
+        let mut provides_to_package = HashMap::new();
 
         for pkg in reader.iter_packages().unwrap() {
             let pkg = pkg.unwrap();
@@ -145,10 +136,13 @@ impl RPMProvider {
             let solvable = pool.intern_solvable(name_id, pack.clone());
 
             for p in pkg.provides() {
-                provides_to_package
+                println!("{} provides {}", pkg.name(), p.name);
+
+                let provides = provides_to_package
                     .entry(p.name.clone())
-                    .or_default()
-                    .push(solvable);
+                    .or_insert_with(Vec::new);
+
+                provides.push(solvable);
             }
         }
 
@@ -159,27 +153,24 @@ impl RPMProvider {
         }
     }
 
-    /// Build a top-level requirement asking for any version of `pkg` (epoch 0,
-    /// version > 0.0.0), mirroring the original CLI behavior.
-    pub fn root_requirement(&self, pkg: &str) -> ConditionalRequirement {
-        let name_id = self.pool.intern_package_name(pkg);
-        let vs_id = self.pool.intern_version_set(
-            name_id,
-            RPMRequirement(Requirement {
-                name: pkg.to_string(),
-                flags: Some("GT".into()),
-                epoch: Some(0.to_string()),
-                version: Some("0.0.0".into()),
-                ..Default::default()
-            }),
-        );
-        ResolvoRequirement::Single(vs_id).into()
+    fn version_set_contains(&self, version_set: VersionSetId, solvable: SolvableId) -> bool {
+        let vs = self.pool.resolve_version_set(version_set);
+        let record = &self.pool.resolve_solvable(solvable).record;
+        let v_package = &record.version;
+        let cmp = vs.to_cmp();
+        if cmp.is_none() || vs.0.version.is_none() {
+            return true;
+        }
+        let v_test = vs.0.version.as_deref().unwrap();
+        version_compare::compare_to(v_package, v_test, cmp.unwrap()).unwrap()
     }
 }
 
 impl Interner for RPMProvider {
     fn display_solvable(&self, solvable: SolvableId) -> impl Display + '_ {
-        self.pool.resolve_solvable(solvable).record.clone()
+        let s = self.pool.resolve_solvable(solvable);
+        let name = self.pool.resolve_package_name(s.name);
+        format!("{} {}", name, s.record)
     }
 
     fn display_name(&self, name: NameId) -> impl Display + '_ {
@@ -187,11 +178,12 @@ impl Interner for RPMProvider {
     }
 
     fn display_version_set(&self, version_set: VersionSetId) -> impl Display + '_ {
-        self.pool.resolve_version_set(version_set).clone()
+        let vs = self.pool.resolve_version_set(version_set);
+        format!("{}", vs)
     }
 
     fn display_string(&self, string_id: StringId) -> impl Display + '_ {
-        self.pool.resolve_string(string_id).to_owned()
+        self.pool.resolve_string(string_id).to_string()
     }
 
     fn version_set_name(&self, version_set: VersionSetId) -> NameId {
@@ -209,8 +201,8 @@ impl Interner for RPMProvider {
         self.pool.resolve_version_set_union(version_set_union)
     }
 
-    fn resolve_condition(&self, _condition: ConditionId) -> Condition {
-        unreachable!("conditional requirements are not used by this provider")
+    fn resolve_condition(&self, condition: ConditionId) -> Condition {
+        self.pool.resolve_condition(condition).clone()
     }
 }
 
@@ -221,14 +213,10 @@ impl DependencyProvider for RPMProvider {
         version_set: VersionSetId,
         inverse: bool,
     ) -> Vec<SolvableId> {
-        let vs = self.pool.resolve_version_set(version_set);
         candidates
             .iter()
             .copied()
-            .filter(|s| {
-                let record = &self.pool.resolve_solvable(*s).record;
-                vs.matches(record) != inverse
-            })
+            .filter(|&s| self.version_set_contains(version_set, s) != inverse)
             .collect()
     }
 
@@ -238,11 +226,10 @@ impl DependencyProvider for RPMProvider {
             let b = &self.pool.resolve_solvable(*b).record;
 
             if a.epoch != b.epoch {
-                return b.epoch.cmp(&a.epoch);
+                return a.epoch.cmp(&b.epoch);
             }
 
-            // Highest version first.
-            version_compare::compare(&b.version, &a.version)
+            version_compare::compare(&a.version, &b.version)
                 .unwrap()
                 .ord()
                 .unwrap()
@@ -251,43 +238,74 @@ impl DependencyProvider for RPMProvider {
 
     async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
         let package_name = self.pool.resolve_package_name(name);
-        let solvables = self.provides_to_package.get(package_name)?;
-
-        let candidates = Candidates {
-            candidates: solvables.clone(),
-            hint_dependencies_available: HintDependenciesAvailable::All,
+        let _package = self.provides_to_package.get(package_name)?;
+        let candidates = match self.provides_to_package.get(package_name) {
+            Some(candidates) => candidates.clone(),
+            None => Vec::default(),
+        };
+        let mut result = Candidates {
+            candidates,
             ..Candidates::default()
         };
 
-        Some(candidates)
+        result.hint_dependencies_available = HintDependenciesAvailable::All;
+
+        // let favor = self.favored.get(package_name);
+        // let locked = self.locked.get(package_name);
+        // let excluded = self.excluded.get(package_name);
+        // for pack in package {
+        //     let solvable = self.pool.resolve_solvable(*pack);
+        //     candidates.candidates.push(solvable);
+        //     // if Some(pack) == favor {
+        //     //     candidates.favored = Some(solvable);
+        //     // }
+        //     // if Some(pack) == locked {
+        //     //     candidates.locked = Some(solvable);
+        //     // }
+        //     // if let Some(excluded) = excluded.and_then(|d| d.get(pack)) {
+        //     //     candidates
+        //     //         .excluded
+        //     //         .push((solvable, self.pool.intern_string(excluded)));
+        //     // }
+        // }
+
+        Some(result)
     }
 
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
-        let record = &self.pool.resolve_solvable(solvable).record;
+        let candidate = self.pool.resolve_solvable(solvable);
+        let pack = &candidate.record;
+
+        let requirements = &pack.requires;
 
         let mut result = KnownDependencies::default();
 
-        for req in &record.requires {
+        for req in requirements {
             if req.name.starts_with('/') || req.name.contains(" if ") {
                 continue;
-            }
+            };
             let dep_name = self.pool.intern_package_name(&req.name);
             let dep_spec = self
                 .pool
                 .intern_version_set(dep_name, RPMRequirement(req.clone()));
-            result.requirements.push(dep_spec.into());
+            result.requirements.push(ConditionalRequirement {
+                condition: None,
+                requirement: ResolvoRequirement::Single(dep_spec),
+            });
         }
-
         if !self.disable_suggest {
-            for req in &record.suggests {
+            for req in &pack.suggests {
                 if req.name.starts_with('/') || req.name.contains(" if ") {
                     continue;
-                }
+                };
                 let dep_name = self.pool.intern_package_name(&req.name);
                 let dep_spec = self
                     .pool
                     .intern_version_set(dep_name, RPMRequirement(req.clone()));
-                result.requirements.push(dep_spec.into());
+                result.requirements.push(ConditionalRequirement {
+                    condition: None,
+                    requirement: ResolvoRequirement::Single(dep_spec),
+                });
             }
         }
 

@@ -1,5 +1,5 @@
-use resolvo::{Interner, Problem, Solver, UnsolvableOrCancelled};
-use rpmrepo_metadata::RepositoryReader;
+use resolvo::{ConditionalRequirement, Interner, Requirement as ResolvoRequirement};
+use rpmrepo_metadata::{RepositoryReader, Requirement};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -11,7 +11,7 @@ use clap::Parser;
 mod rpm_fetch;
 mod rpm_provider;
 
-use rpm_provider::RPMProvider;
+use rpm_provider::{RPMProvider, RPMRequirement};
 
 #[allow(dead_code)]
 fn print_pkgs(path: &Path) {
@@ -59,33 +59,51 @@ fn main() {
 
     let target_folder = args.target_folder;
 
+    // let url = Url::parse("https://mirrors.xtom.de/fedora/updates/38/Everything/x86_64/").unwrap();
+    // fetch_repodata(url, &target_folder);
+
     let url =
         Url::parse("https://mirrors.xtom.de/fedora/releases/38/Everything/x86_64/os/").unwrap();
     rpm_fetch::fetch_repodata(url, &target_folder);
 
+    // print_pkgs(&target_folder);
+
     let provider = RPMProvider::from_repodata(&target_folder, args.disable_suggest);
     println!("Provider created ...");
+    let mut solver = resolvo::Solver::new(provider);
 
-    let requirements: Vec<_> = args
-        .packages
-        .iter()
-        .map(|pkg| {
-            println!("Resolving for: {}", pkg);
-            provider.root_requirement(pkg)
-        })
-        .collect();
+    let mut requirements = Vec::new();
+    for pkg in args.packages {
+        let spec = RPMRequirement(Requirement {
+            name: pkg.to_string(),
+            flags: Some("GT".into()),
+            epoch: Some(0.to_string()),
+            version: Some("0.0.0".into()),
+            ..Default::default()
+        });
+        println!("Resolving for: {}", spec);
+        let name_id = solver.provider().pool.intern_package_name(pkg);
+        let spec_id = solver.provider().pool.intern_version_set(name_id, spec);
 
-    let mut solver = Solver::new(provider);
-    let problem = Problem::new().requirements(requirements);
+        requirements.push(ConditionalRequirement {
+            condition: None,
+            requirement: ResolvoRequirement::Single(spec_id),
+        });
+    }
+
+    let problem = resolvo::Problem::new().requirements(requirements);
 
     let solvables = match solver.solve(problem) {
         Ok(solvables) => solvables,
-        Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
-            println!("Error: {}", conflict.display_user_friendly(&solver));
-            return;
-        }
-        Err(UnsolvableOrCancelled::Cancelled(_)) => {
-            println!("Solver cancelled");
+        Err(problem) => {
+            match problem {
+                resolvo::UnsolvableOrCancelled::Unsolvable(conflict) => {
+                    println!("Error: {}", conflict.display_user_friendly(&solver));
+                }
+                resolvo::UnsolvableOrCancelled::Cancelled(_) => {
+                    println!("Cancelled");
+                }
+            }
             return;
         }
     };
@@ -93,7 +111,7 @@ fn main() {
     let provider = solver.provider();
     let resolved: BTreeSet<String> = solvables
         .iter()
-        .map(|s| provider.display_solvable(*s).to_string())
+        .map(|s| format!("{}", provider.display_solvable(*s)))
         .collect();
 
     println!("Resolved:\n");
