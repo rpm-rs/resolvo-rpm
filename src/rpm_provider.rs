@@ -5,17 +5,25 @@ use resolvo::{
     VersionSetUnionId,
     utils::{Pool, VersionSet},
 };
+use rpm::Evr;
 use rpmrepo_metadata::{RepositoryReader, Requirement};
-use std::{collections::HashMap, fmt::Display, hash::Hash, path::Path};
+use std::{cmp::Ordering, collections::HashMap, fmt::Display, hash::Hash, path::Path};
 
 #[derive(Default, Debug, Clone)]
 pub struct RPMPackageVersion {
-    pub package: String,
+    pub name: String,
+    pub epoch: String,
     pub version: String,
-    pub epoch: u32,
+    pub release: String,
     pub requires: Vec<Requirement>,
     pub suggests: Vec<Requirement>,
     // provides: Vec<Requirement>,
+}
+
+impl RPMPackageVersion {
+    fn evr(&self) -> Evr<'_> {
+        Evr::new(self.epoch.as_str(), self.version.as_str(), self.release.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +61,7 @@ impl Display for RPMRequirement {
 
 impl PartialEq for RPMPackageVersion {
     fn eq(&self, other: &Self) -> bool {
-        self.package == other.package && self.version == other.version
+        self.name == other.name && self.evr() == other.evr()
     }
 }
 
@@ -67,38 +75,47 @@ impl PartialOrd for RPMPackageVersion {
 
 impl Ord for RPMPackageVersion {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if self.epoch != other.epoch {
-            return self.epoch.cmp(&other.epoch);
-        }
-
-        version_compare::compare(&self.version, &other.version)
-            .unwrap()
-            .ord()
-            .unwrap()
+        self.evr().cmp(&other.evr())
     }
 }
 
 impl Display for RPMPackageVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.version)?;
-        if self.epoch != 0 {
-            write!(f, " ({})", self.epoch)?;
-        }
-        Ok(())
+        write!(f, "{}", self.evr())
     }
 }
 
-impl RPMRequirement {
-    fn to_cmp(&self) -> Option<version_compare::Cmp> {
-        match self.0.flags.as_deref().unwrap_or("") {
-            "EQ" => Some(version_compare::Cmp::Eq),
-            "GT" => Some(version_compare::Cmp::Gt),
-            "GE" => Some(version_compare::Cmp::Ge),
-            "LT" => Some(version_compare::Cmp::Lt),
-            "LE" => Some(version_compare::Cmp::Le),
-            "NE" => Some(version_compare::Cmp::Ne),
-            _ => None,
-        }
+fn check_version_constraint(
+    flags: Option<&str>,
+    req_epoch: Option<&str>,
+    req_version: Option<&str>,
+    req_release: Option<&str>,
+    candidate: &RPMPackageVersion,
+) -> bool {
+    let flags = match flags {
+        Some(f) => f,
+        None => return true,
+    };
+    let req_version = match req_version {
+        Some(v) => v,
+        None => return true,
+    };
+
+    let req_evr = Evr::new(
+        req_epoch.unwrap_or(""),
+        req_version,
+        req_release.unwrap_or(""),
+    );
+    let pkg_evr = candidate.evr();
+
+    let ord = pkg_evr.cmp(&req_evr);
+    match flags {
+        "EQ" => ord == Ordering::Equal,
+        "LT" => ord == Ordering::Less,
+        "GT" => ord == Ordering::Greater,
+        "LE" => ord == Ordering::Less || ord == Ordering::Equal,
+        "GE" => ord == Ordering::Greater || ord == Ordering::Equal,
+        _ => true,
     }
 }
 
@@ -125,11 +142,13 @@ impl RPMProvider {
             let pkg = pkg.unwrap();
 
             let pack = RPMPackageVersion {
-                package: pkg.name().to_string(),
+                name: pkg.name().to_string(),
+                epoch: pkg.epoch().to_string(),
                 version: pkg.version().to_string(),
-                epoch: pkg.epoch(),
+                release: pkg.release().to_string(),
                 requires: pkg.requires().to_vec(),
                 suggests: pkg.suggests().to_vec(),
+                // provides: Vec<Requirement>,
             };
 
             let name_id = pool.intern_package_name(pkg.name());
@@ -156,13 +175,13 @@ impl RPMProvider {
     fn version_set_contains(&self, version_set: VersionSetId, solvable: SolvableId) -> bool {
         let vs = self.pool.resolve_version_set(version_set);
         let record = &self.pool.resolve_solvable(solvable).record;
-        let v_package = &record.version;
-        let cmp = vs.to_cmp();
-        if cmp.is_none() || vs.0.version.is_none() {
-            return true;
-        }
-        let v_test = vs.0.version.as_deref().unwrap();
-        version_compare::compare_to(v_package, v_test, cmp.unwrap()).unwrap()
+        check_version_constraint(
+            vs.0.flags.as_deref(),
+            vs.0.epoch.as_deref(),
+            vs.0.version.as_deref(),
+            vs.0.release.as_deref(),
+            record,
+        )
     }
 }
 
@@ -224,15 +243,7 @@ impl DependencyProvider for RPMProvider {
         solvables.sort_by(|a, b| {
             let a = &self.pool.resolve_solvable(*a).record;
             let b = &self.pool.resolve_solvable(*b).record;
-
-            if a.epoch != b.epoch {
-                return a.epoch.cmp(&b.epoch);
-            }
-
-            version_compare::compare(&a.version, &b.version)
-                .unwrap()
-                .ord()
-                .unwrap()
+            a.cmp(b)
         });
     }
 
