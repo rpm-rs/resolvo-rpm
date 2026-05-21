@@ -1,50 +1,32 @@
-use resolvo::{ConditionalRequirement, Interner, Requirement as ResolvoRequirement};
-use rpmrepo_metadata::{RepositoryReader, Requirement};
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-};
-use url::Url;
+use resolvo_rpm::{ResolveOptions, RpmProvider, resolve};
+use std::{collections::BTreeSet, path::PathBuf, process};
 
 use clap::Parser;
 
-mod rpm_fetch;
-mod rpm_provider;
-
-use rpm_provider::{RPMProvider, RPMRequirement};
-
-#[allow(dead_code)]
-fn print_pkgs(path: &Path) {
-    let reader = RepositoryReader::new_from_directory(path).unwrap();
-
-    for pkg in reader.iter_packages().unwrap() {
-        let pkg = pkg.unwrap();
-        println!(
-            "{}-{}-{}-{}",
-            pkg.name(),
-            pkg.version(),
-            pkg.release(),
-            pkg.arch()
-        );
-
-        println!("Provides:   {:?}", pkg.provides());
-        println!("Requires:   {:?}", pkg.requires());
-        println!("Recommends: {:?}", pkg.recommends());
-        println!("Suggests:   {:?}", pkg.suggests());
-        println!("Conflicts:  {:?}", pkg.conflicts());
-    }
-}
-
+/// Resolve RPM package dependencies using a SAT solver.
+///
+/// Takes one or more local repodata directories and a list of packages
+/// to resolve dependencies for, then prints the full dependency closure.
 #[derive(Debug, Parser)]
 struct Args {
-    #[clap(long, default_value = "./fedora")]
-    target_folder: PathBuf,
+    /// Paths to local repodata directories (must contain repodata/repomd.xml).
+    /// Can be specified multiple times. Repos listed first have higher priority.
+    #[clap(long, required = true)]
+    repo: Vec<PathBuf>,
 
+    /// Package names to resolve dependencies for.
     #[clap(required = true)]
     packages: Vec<String>,
 
+    /// Target architecture. Only packages matching this arch (and noarch)
+    /// will be considered. If omitted, all architectures are included.
     #[clap(long)]
-    disable_suggest: bool,
+    arch: Option<String>,
+
+    /// Disable Recommends. By default, recommended packages are installed
+    /// if available (matching dnf behavior). This flag skips them entirely.
+    #[clap(long)]
+    disable_recommends: bool,
 }
 
 fn main() {
@@ -52,71 +34,71 @@ fn main() {
 
     let args = Args::parse();
 
-    if args.packages.is_empty() {
-        println!("No packages specified. Add some on the command line.");
-        return;
+    let mut provider = RpmProvider::new(args.arch.as_deref());
+    for repo_path in &args.repo {
+        let repo_label = &repo_path.display().to_string();
+        provider.load_repo(repo_path, repo_label);
     }
 
-    let target_folder = args.target_folder;
-
-    // let url = Url::parse("https://mirrors.xtom.de/fedora/updates/38/Everything/x86_64/").unwrap();
-    // fetch_repodata(url, &target_folder);
-
-    let url =
-        Url::parse("https://mirrors.xtom.de/fedora/releases/38/Everything/x86_64/os/").unwrap();
-    rpm_fetch::fetch_repodata(url, &target_folder);
-
-    // print_pkgs(&target_folder);
-
-    let provider = RPMProvider::from_repodata(&target_folder, args.disable_suggest);
-    println!("Provider created ...");
     let mut solver = resolvo::Solver::new(provider);
+    let pkg_names: Vec<&str> = args.packages.iter().map(|s| s.as_str()).collect();
+    let options = ResolveOptions::new().enable_recommends(!args.disable_recommends);
 
-    let mut requirements = Vec::new();
-    for pkg in args.packages {
-        let spec = RPMRequirement(Requirement {
-            name: pkg.to_string(),
-            flags: Some("GT".into()),
-            epoch: Some(0.to_string()),
-            version: Some("0.0.0".into()),
-            ..Default::default()
-        });
-        println!("Resolving for: {}", spec);
-        let name_id = solver.provider().pool.intern_package_name(pkg);
-        let spec_id = solver.provider().pool.intern_version_set(name_id, spec);
-
-        requirements.push(ConditionalRequirement {
-            condition: None,
-            requirement: ResolvoRequirement::Single(spec_id),
-        });
-    }
-
-    let problem = resolvo::Problem::new().requirements(requirements);
-
-    let solvables = match solver.solve(problem) {
-        Ok(solvables) => solvables,
-        Err(problem) => {
-            match problem {
-                resolvo::UnsolvableOrCancelled::Unsolvable(conflict) => {
-                    println!("Error: {}", conflict.display_user_friendly(&solver));
-                }
-                resolvo::UnsolvableOrCancelled::Cancelled(_) => {
-                    println!("Cancelled");
-                }
-            }
-            return;
-        }
+    let solvables = match resolve(&mut solver, &pkg_names, &options) {
+        Ok(s) => s,
+        Err(err) => report_error(&solver, err),
     };
 
+    print_resolution(&solver, &solvables);
+}
+
+/// Print the resolved packages in alphabetical order, aligned in columns,
+/// with repo labels and a total count on stderr.
+fn print_resolution(solver: &resolvo::Solver<RpmProvider>, solvables: &[resolvo::SolvableId]) {
     let provider = solver.provider();
-    let resolved: BTreeSet<String> = solvables
+    let resolved: BTreeSet<(String, String, &str)> = solvables
         .iter()
-        .map(|s| format!("{}", provider.display_solvable(*s)))
+        .map(|s| {
+            let name = provider.package_name(*s).to_string();
+            let version = provider.package_version(*s).to_string();
+            let repo = provider.repo_label(*s);
+            (name, version, repo)
+        })
         .collect();
 
-    println!("Resolved:\n");
-
-    for r in resolved {
-        println!("- {}", r);
+    let name_width = resolved
+        .iter()
+        .map(|(name, _, _)| name.len())
+        .max()
+        .unwrap_or(0);
+    let ver_width = resolved
+        .iter()
+        .map(|(_, ver, _)| ver.len())
+        .max()
+        .unwrap_or(0);
+    for (name, version, repo) in &resolved {
+        println!(
+            "{:<nw$}  {:<vw$}  [{}]",
+            name,
+            version,
+            repo,
+            nw = name_width,
+            vw = ver_width
+        );
     }
+
+    eprintln!("\n{} packages resolved", resolved.len());
+}
+
+/// Print the solver error to stderr and exit with status 1.
+fn report_error(solver: &resolvo::Solver<RpmProvider>, err: resolvo::UnsolvableOrCancelled) -> ! {
+    match err {
+        resolvo::UnsolvableOrCancelled::Unsolvable(conflict) => {
+            eprintln!("Error: {}", conflict.display_user_friendly(solver));
+        }
+        resolvo::UnsolvableOrCancelled::Cancelled(_) => {
+            eprintln!("Cancelled");
+        }
+    }
+    process::exit(1);
 }
