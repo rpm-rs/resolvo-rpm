@@ -14,7 +14,7 @@ ahash = "0.8.12"
 clap = { version = "4.6.1", features = ["derive"] }
 reqwest = { version = "0.13.3", features = ["blocking"] }
 resolvo = { path = "../resolvo" }
-rpm-version = "0.2"
+rpm-version = "0.4"
 rpmrepo_metadata = { path = "../rpmrepo_metadata" }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
@@ -26,6 +26,3 @@ criterion = { version = "0.8", features = ["html_reports"] }
 [[bench]]
 name = "resolve"
 harness = false
-
-[[example]]
-name = "profile_visitor"

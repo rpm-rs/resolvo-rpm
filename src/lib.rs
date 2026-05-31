@@ -30,7 +30,7 @@ use resolvo::{
     utils::{Pool, VersionSet},
 };
 use rpm_version::Evr;
-use rpmrepo_metadata::RequirementType;
+pub use rpmrepo_metadata::RequirementType;
 use std::{cell::RefCell, cmp::Ordering, fmt::Display, hash::Hash, path::PathBuf};
 
 type HashMap<K, V> = ahash::AHashMap<K, V>;
@@ -308,6 +308,89 @@ impl RpmProvider {
         soft
     }
 
+    /// Check the dependency closure of packages in the loaded repos.
+    ///
+    /// For every package selected by `options`, checks whether each of its
+    /// Requires can be satisfied by at least one package in the full repo set.
+    /// Returns a list of unsatisfied dependencies as
+    /// `(package_solvable_id, requirement_version_set_id)` pairs.
+    ///
+    /// Use [`ClosureOptions`] to narrow the scope:
+    /// - `check_repos`: only check packages from the listed repos (all repos
+    ///   remain available for satisfying deps)
+    /// - `newest_only`: only check the newest version of each (name, arch) pair
+    ///
+    /// This is a *shallow* check: for each requirement, it only verifies that
+    /// at least one candidate provider exists and matches the version constraint.
+    /// It does NOT perform full transitive resolution (no SAT solving), so it
+    /// won't detect cases where a provider exists but its own dependencies are
+    /// unsatisfiable. This matches the behavior of tools like `repoclosure`.
+    ///
+    /// Rich/boolean dependencies (e.g. `(foo or bar)`) are skipped during
+    /// loading and will not be checked here.
+    ///
+    /// Filelists are loaded eagerly so that file-path dependencies (e.g.
+    /// `Requires: /usr/bin/python3`) are checked against the full file index,
+    /// not just the subset in primary.xml.
+    pub fn check_closure(&self, options: &ClosureOptions) -> Vec<(SolvableId, VersionSetId)> {
+        self.load_filelists();
+
+        let provides_map = self.provides_to_package.borrow();
+
+        let solvables_to_check: Vec<(SolvableId, &RpmPackageVersion)> = if options.newest_only {
+            // Group by (NameId, arch), keeping only the highest-EVR solvable.
+            let mut newest: HashMap<(NameId, &str), (SolvableId, &RpmPackageVersion)> =
+                HashMap::new();
+            for (sid, solvable) in self.pool.iter_solvables() {
+                let record = &solvable.record;
+                if !options.check_repos.is_empty()
+                    && !options.check_repos.contains(&record.repo_id)
+                {
+                    continue;
+                }
+                let key = (solvable.name, record.arch.as_str());
+                newest
+                    .entry(key)
+                    .and_modify(|(prev_sid, prev_record)| {
+                        if record > *prev_record {
+                            *prev_sid = sid;
+                            *prev_record = record;
+                        }
+                    })
+                    .or_insert((sid, record));
+            }
+            newest.into_values().collect()
+        } else {
+            self.pool
+                .iter_solvables()
+                .filter(|(_, solvable)| {
+                    options.check_repos.is_empty()
+                        || options.check_repos.contains(&solvable.record.repo_id)
+                })
+                .map(|(sid, solvable)| (sid, &solvable.record))
+                .collect()
+        };
+
+        let mut unsatisfied = Vec::new();
+        for (sid, record) in &solvables_to_check {
+            for &vs_id in &record.requires {
+                let req_name_id = self.pool.resolve_version_set_package_name(vs_id);
+                let satisfied = provides_map
+                    .get(req_name_id)
+                    .is_some_and(|candidates| {
+                        candidates
+                            .iter()
+                            .any(|&cand| self.version_set_contains(vs_id, cand))
+                    });
+                if !satisfied {
+                    unsatisfied.push((*sid, vs_id));
+                }
+            }
+        }
+
+        unsatisfied
+    }
+
     /// Return the package name for a resolved solvable (e.g. "bash").
     pub fn package_name(&self, solvable: SolvableId) -> &str {
         let record = &self.pool.resolve_solvable(solvable).record;
@@ -467,6 +550,47 @@ impl Default for ResolveOptions {
         Self {
             enable_recommends: true,
         }
+    }
+}
+
+/// Options controlling dependency closure checking behavior.
+///
+/// Defaults check all packages in all repos. Use the builder methods to
+/// narrow the scope:
+///
+/// ```
+/// use resolvo_rpm::ClosureOptions;
+///
+/// let opts = ClosureOptions::new()
+///     .check_repos(vec![1])
+///     .newest_only(true);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ClosureOptions {
+    pub(crate) check_repos: Vec<usize>,
+    pub(crate) newest_only: bool,
+}
+
+impl ClosureOptions {
+    /// Create options with default settings (check all repos, all versions).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Only check packages from these repos (by repo_id) for unsatisfied deps.
+    /// Other repos are still used to satisfy dependencies. An empty list
+    /// (the default) checks all repos.
+    pub fn check_repos(mut self, repos: Vec<usize>) -> Self {
+        self.check_repos = repos;
+        self
+    }
+
+    /// Only check the newest version of each (name, arch) pair.
+    /// Older versions are skipped during the closure check but remain
+    /// available for satisfying other packages' dependencies.
+    pub fn newest_only(mut self, newest: bool) -> Self {
+        self.newest_only = newest;
+        self
     }
 }
 
