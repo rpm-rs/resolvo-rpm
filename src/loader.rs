@@ -5,7 +5,7 @@ use rpmrepo_metadata::FileType;
 use rpmrepo_metadata::visitor::{FilelistsVisitor, PrimaryVisitor, RequirementData};
 
 use crate::{
-    HashMap, LoadOptions, ProvidesMap, ProvidesVersion, RpmPackageVersion, RpmProvider,
+    HashMap, LoadOptions, PackageSpec, ProvidesMap, ProvidesVersion, RpmPackageVersion, RpmProvider,
     RpmRequirement, invert_flags,
 };
 
@@ -326,7 +326,7 @@ impl PrimaryVisitor for PrimaryLoaderVisitor<'_> {
 
 /// Visitor that streams filelists.xml and registers file paths as provides.
 ///
-/// Unlike `PrimaryLoaderVisitor`, this doesn't create solvables — they already
+/// Unlike `PrimaryLoaderVisitor`, this doesn't create solvables - they already
 /// exist from primary.xml parsing. Instead, it looks up existing solvables by
 /// package name and adds their file paths to the provides map so that file
 /// dependencies (e.g. `Requires: /usr/lib64/libcurl.so.4`) can be resolved.
@@ -422,6 +422,82 @@ impl RpmProvider {
         }
     }
 
+    /// Register a named repository, returning its `repo_id` for use with
+    /// [`add_package`](Self::add_package).
+    pub fn add_repo(&mut self, label: &str) -> usize {
+        let repo_id = self.repo_labels.len();
+        self.repo_labels.push(label.to_string());
+        repo_id
+    }
+
+    /// Add a single package to the solver pool.
+    ///
+    /// Unlike [`load_repo()`](Self::load_repo), this does not apply
+    /// `target_arch` filtering — the caller controls which packages are added.
+    pub fn add_package(&mut self, repo_id: usize, spec: &PackageSpec<'_>) -> SolvableId {
+        let requires: Vec<_> = spec
+            .requires
+            .iter()
+            .map(|r| intern_requirement(&self.pool, r))
+            .collect();
+        let conflicts: Vec<_> = spec
+            .conflicts
+            .iter()
+            .map(|r| intern_inverted_requirement(&self.pool, r))
+            .collect();
+        let recommends: Vec<_> = spec
+            .recommends
+            .iter()
+            .map(|r| intern_requirement(&self.pool, r))
+            .collect();
+
+        let name_id = self.pool.intern_package_name(spec.name);
+
+        let pack = RpmPackageVersion {
+            name: spec.name.to_owned(),
+            epoch: spec.epoch.to_owned(),
+            version: spec.version.to_owned(),
+            release: spec.release.to_owned(),
+            arch: spec.arch.to_owned(),
+            repo_id,
+            requires,
+            conflicts,
+            recommends,
+        };
+
+        let solvable = self.pool.intern_solvable(name_id, pack);
+
+        let mut provides_map = self.provides_to_package.borrow_mut();
+
+        // Every package implicitly provides its own name.
+        provides_map.entry(name_id).push(solvable);
+
+        // Register explicit Provides entries.
+        for prov in spec.provides {
+            let cap_id = self.pool.intern_package_name(prov.name);
+            provides_map.entry(cap_id).push(solvable);
+
+            if prov.version.is_some() || prov.epoch.is_some() || prov.release.is_some() {
+                self.provides_versions.insert(
+                    (solvable, cap_id),
+                    ProvidesVersion {
+                        epoch: prov.epoch.unwrap_or_default().to_owned(),
+                        version: prov.version.unwrap_or_default().to_owned(),
+                        release: prov.release.unwrap_or_default().to_owned(),
+                    },
+                );
+            }
+        }
+
+        // Register file paths as provides.
+        for &file_path in spec.files {
+            let file_id = self.pool.intern_package_name(file_path);
+            provides_map.entry(file_id).push(solvable);
+        }
+
+        solvable
+    }
+
     /// Parse filelists.xml for all loaded repos and index every file path
     /// into the provides map. Called lazily on the first `get_candidates` miss
     /// for a `/`-prefixed capability name.
@@ -506,5 +582,130 @@ mod tests {
             set.iter().any(|s| s.starts_with("python3-dnf ")),
             "python3-dnf must be in the result"
         );
+    }
+
+    #[test]
+    fn resolve_manual_packages() {
+        use crate::{DependencySpec, PackageSpec};
+        use rpmrepo_metadata::RequirementType;
+
+        let mut provider = RpmProvider::new(None);
+        let repo = provider.add_repo("test");
+
+        // Package "app" requires "lib"
+        provider.add_package(
+            repo,
+            &PackageSpec {
+                name: "app",
+                epoch: "0",
+                version: "1.0",
+                release: "1",
+                arch: "x86_64",
+                requires: &[DependencySpec {
+                    name: "lib",
+                    flags: Some(RequirementType::GE),
+                    epoch: None,
+                    version: Some("1.0"),
+                    release: None,
+                    preinstall: false,
+                }],
+                provides: &[],
+                conflicts: &[],
+                recommends: &[],
+                files: &[],
+            },
+        );
+
+        // Package "lib" provides itself
+        provider.add_package(
+            repo,
+            &PackageSpec {
+                name: "lib",
+                epoch: "0",
+                version: "2.0",
+                release: "1",
+                arch: "x86_64",
+                requires: &[],
+                provides: &[],
+                conflicts: &[],
+                recommends: &[],
+                files: &[],
+            },
+        );
+
+        let mut solver = resolvo::Solver::new(provider);
+        let result = resolve(&mut solver, &["app"], &ResolveOptions::new()).unwrap();
+        let names: BTreeSet<&str> = result
+            .iter()
+            .map(|s| solver.provider().package_name(*s))
+            .collect();
+
+        assert_eq!(names, BTreeSet::from(["app", "lib"]));
+    }
+
+    #[test]
+    fn resolve_manual_provides() {
+        use crate::{DependencySpec, PackageSpec};
+        use rpmrepo_metadata::RequirementType;
+
+        let mut provider = RpmProvider::new(None);
+        let repo = provider.add_repo("test");
+
+        // Package "app" requires capability "libfoo"
+        provider.add_package(
+            repo,
+            &PackageSpec {
+                name: "app",
+                epoch: "0",
+                version: "1.0",
+                release: "1",
+                arch: "x86_64",
+                requires: &[DependencySpec {
+                    name: "libfoo",
+                    flags: None,
+                    epoch: None,
+                    version: None,
+                    release: None,
+                    preinstall: false,
+                }],
+                provides: &[],
+                conflicts: &[],
+                recommends: &[],
+                files: &[],
+            },
+        );
+
+        // Package "foo-impl" provides "libfoo" at version 3.0
+        provider.add_package(
+            repo,
+            &PackageSpec {
+                name: "foo-impl",
+                epoch: "0",
+                version: "1.0",
+                release: "1",
+                arch: "x86_64",
+                requires: &[],
+                provides: &[DependencySpec {
+                    name: "libfoo",
+                    flags: Some(RequirementType::EQ),
+                    epoch: None,
+                    version: Some("3.0"),
+                    release: None,
+                    preinstall: false,
+                }],
+                conflicts: &[],
+                recommends: &[],
+                files: &[],
+            },
+        );
+
+        let mut solver = resolvo::Solver::new(provider);
+        let result = resolve(&mut solver, &["app"], &ResolveOptions::new()).unwrap();
+        let names: BTreeSet<&str> = result
+            .iter()
+            .map(|s| solver.provider().package_name(*s))
+            .collect();
+
+        assert_eq!(names, BTreeSet::from(["app", "foo-impl"]));
     }
 }

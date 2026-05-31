@@ -105,6 +105,32 @@ pub struct RpmRequirement {
     pub preinstall: bool,
 }
 
+/// A dependency entry for the programmatic package-addition API.
+///
+/// Used for Requires, Provides, Conflicts, and Recommends in [`PackageSpec`].
+/// For Provides entries, `flags` and `preinstall` are ignored.
+///
+/// Re-exported from `rpmrepo_metadata::visitor::RequirementData`.
+pub use rpmrepo_metadata::visitor::RequirementData as DependencySpec;
+
+/// A complete package description for manual addition to the solver pool.
+///
+/// Construct this and pass it to [`RpmProvider::add_package()`] to add
+/// packages without loading repository metadata files.
+#[derive(Debug, Clone)]
+pub struct PackageSpec<'a> {
+    pub name: &'a str,
+    pub epoch: &'a str,
+    pub version: &'a str,
+    pub release: &'a str,
+    pub arch: &'a str,
+    pub requires: &'a [DependencySpec<'a>],
+    pub provides: &'a [DependencySpec<'a>],
+    pub conflicts: &'a [DependencySpec<'a>],
+    pub recommends: &'a [DependencySpec<'a>],
+    pub files: &'a [&'a str],
+}
+
 impl PartialEq for RpmPackageVersion {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name && self.evr() == other.evr()
@@ -374,7 +400,7 @@ pub fn make_install_requirements(
 ///
 /// let opts = LoadOptions::new().load_filelists(true);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct LoadOptions {
     pub(crate) load_filelists: bool,
 }
