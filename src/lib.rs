@@ -23,7 +23,7 @@ pub mod fetch;
 mod loader;
 
 use resolvo::{
-    ArenaId, Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies,
+    Candidates, Condition, ConditionId, ConditionalRequirement, DenseIndex, Dependencies,
     DependencyProvider, HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem,
     Requirement as ResolvoRequirement, SolvableId, SolverCache, StringId, UnsolvableOrCancelled,
     VersionSetId, VersionSetUnionId,
@@ -44,13 +44,13 @@ impl ProvidesMap {
     /// Look up the solvables that provide a given capability, or `None` if
     /// no package provides it.
     fn get(&self, id: NameId) -> Option<&Vec<SolvableId>> {
-        self.0.get(id.to_usize()).filter(|v| !v.is_empty())
+        self.0.get(id.to_index()).filter(|v| !v.is_empty())
     }
 
     /// Return a mutable reference to the solvable list for a capability,
     /// growing the backing vec (with power-of-two sizing) if needed.
     fn entry(&mut self, id: NameId) -> &mut Vec<SolvableId> {
-        let idx = id.to_usize();
+        let idx = id.to_index();
         if idx >= self.0.len() {
             self.0.resize_with((idx + 1).next_power_of_two(), Vec::new);
         }
@@ -73,9 +73,11 @@ pub struct RpmPackageVersion {
     pub repo_id: usize,
     pub requires: Vec<VersionSetId>,
     pub conflicts: Vec<VersionSetId>,
+    pub obsoletes: Vec<VersionSetId>,
     pub recommends: Vec<VersionSetId>,
-    // TODO: suggests, obsoletes, supplements, enhances are not yet used by the
-    // solver. Add them as Vec<VersionSetId> when needed (see get_dependencies).
+    pub suggests: Vec<VersionSetId>,
+    pub supplements: Vec<VersionSetId>,
+    pub enhances: Vec<VersionSetId>,
 }
 
 impl RpmPackageVersion {
@@ -127,7 +129,11 @@ pub struct PackageSpec<'a> {
     pub requires: &'a [DependencySpec<'a>],
     pub provides: &'a [DependencySpec<'a>],
     pub conflicts: &'a [DependencySpec<'a>],
+    pub obsoletes: &'a [DependencySpec<'a>],
     pub recommends: &'a [DependencySpec<'a>],
+    pub suggests: &'a [DependencySpec<'a>],
+    pub supplements: &'a [DependencySpec<'a>],
+    pub enhances: &'a [DependencySpec<'a>],
     pub files: &'a [&'a str],
 }
 
@@ -279,19 +285,24 @@ impl RpmProvider {
         }
     }
 
-    /// Collect candidate solvable IDs for all Recommends of the given resolved packages.
+    /// Collect candidate solvable IDs for weak deps of the given resolved packages.
     ///
-    /// For each resolved solvable, looks at its Recommends entries, finds candidate
-    /// solvables that provide each recommended capability, and returns them. The
-    /// caller can pass these to `Problem::soft_requirements` so the solver tries
-    /// to include them without failing if they're unsatisfiable.
-    pub fn collect_recommended_solvables(&self, resolved: &[SolvableId]) -> Vec<SolvableId> {
+    /// For each resolved solvable, reads the dependency list returned by `f`,
+    /// finds candidate solvables that provide each capability, and returns the
+    /// deduplicated list. The caller can pass these to `Problem::soft_requirements`
+    /// so the solver tries to include them without failing if they're unsatisfiable.
+    #[inline(always)]
+    fn collect_soft_dep_solvables(
+        &self,
+        resolved: &[SolvableId],
+        f: impl Fn(&RpmPackageVersion) -> &[VersionSetId],
+    ) -> Vec<SolvableId> {
         let provides_map = self.provides_to_package.borrow();
         let mut soft = Vec::new();
 
         for &sid in resolved {
             let pack = &self.pool.resolve_solvable(sid).record;
-            for &vs_id in &pack.recommends {
+            for &vs_id in f(pack) {
                 let req_name_id = self.pool.resolve_version_set_package_name(vs_id);
                 if let Some(candidates) = provides_map.get(req_name_id) {
                     for &candidate in candidates {
@@ -306,6 +317,16 @@ impl RpmProvider {
         soft.sort();
         soft.dedup();
         soft
+    }
+
+    /// Collect candidate solvable IDs for all Recommends of the given resolved packages.
+    pub fn collect_recommended_solvables(&self, resolved: &[SolvableId]) -> Vec<SolvableId> {
+        self.collect_soft_dep_solvables(resolved, |pack| &pack.recommends)
+    }
+
+    /// Collect candidate solvable IDs for all Suggests of the given resolved packages.
+    pub fn collect_suggested_solvables(&self, resolved: &[SolvableId]) -> Vec<SolvableId> {
+        self.collect_soft_dep_solvables(resolved, |pack| &pack.suggests)
     }
 
     /// Check the dependency closure of packages in the loaded repos.
@@ -343,8 +364,7 @@ impl RpmProvider {
                 HashMap::new();
             for (sid, solvable) in self.pool.iter_solvables() {
                 let record = &solvable.record;
-                if !options.check_repos.is_empty()
-                    && !options.check_repos.contains(&record.repo_id)
+                if !options.check_repos.is_empty() && !options.check_repos.contains(&record.repo_id)
                 {
                     continue;
                 }
@@ -375,13 +395,11 @@ impl RpmProvider {
         for (sid, record) in &solvables_to_check {
             for &vs_id in &record.requires {
                 let req_name_id = self.pool.resolve_version_set_package_name(vs_id);
-                let satisfied = provides_map
-                    .get(req_name_id)
-                    .is_some_and(|candidates| {
-                        candidates
-                            .iter()
-                            .any(|&cand| self.version_set_contains(vs_id, cand))
-                    });
+                let satisfied = provides_map.get(req_name_id).is_some_and(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|&cand| self.version_set_contains(vs_id, cand))
+                });
                 if !satisfied {
                     unsatisfied.push((*sid, vs_id));
                 }
@@ -527,10 +545,11 @@ impl Default for LoadOptions {
 #[derive(Debug, Clone)]
 pub struct ResolveOptions {
     pub(crate) enable_recommends: bool,
+    pub(crate) enable_suggests: bool,
 }
 
 impl ResolveOptions {
-    /// Create options with default settings (Recommends enabled).
+    /// Create options with default settings (Recommends enabled, Suggests disabled).
     pub fn new() -> Self {
         Self::default()
     }
@@ -543,12 +562,22 @@ impl ResolveOptions {
         self.enable_recommends = enable;
         self
     }
+
+    /// Set whether Suggests are pulled in as soft requirements.
+    ///
+    /// When true, suggested packages are added as soft requirements alongside
+    /// Recommends. When false (the default, matching dnf), Suggests are ignored.
+    pub fn enable_suggests(mut self, enable: bool) -> Self {
+        self.enable_suggests = enable;
+        self
+    }
 }
 
 impl Default for ResolveOptions {
     fn default() -> Self {
         Self {
             enable_recommends: true,
+            enable_suggests: false,
         }
     }
 }
@@ -609,10 +638,18 @@ pub fn resolve(
 ) -> Result<Vec<SolvableId>, UnsolvableOrCancelled> {
     let requirements = make_install_requirements(&solver.provider().pool, packages);
 
-    if options.enable_recommends {
+    if options.enable_recommends || options.enable_suggests {
         let hard = solver.solve(Problem::new().requirements(requirements.clone()))?;
 
-        let soft = solver.provider().collect_recommended_solvables(&hard);
+        let mut soft = Vec::new();
+        if options.enable_recommends {
+            soft.extend(solver.provider().collect_recommended_solvables(&hard));
+        }
+        if options.enable_suggests {
+            soft.extend(solver.provider().collect_suggested_solvables(&hard));
+        }
+        soft.sort();
+        soft.dedup();
 
         if soft.is_empty() {
             return Ok(hard);
@@ -632,6 +669,9 @@ pub fn resolve(
 /// string/name/version-set resolution, formatting them for human-readable
 /// solver output (error messages, debug traces).
 impl Interner for RpmProvider {
+    type NameId = resolvo::NameId;
+    type SolvableId = resolvo::SolvableId;
+
     /// Format as "name epoch:version-release" (e.g. "bash 0:5.2.26-4.el10").
     fn display_solvable(&self, solvable: SolvableId) -> impl Display + '_ {
         let s = self.pool.resolve_solvable(solvable);
@@ -788,10 +828,10 @@ impl DependencyProvider for RpmProvider {
         // (see collect_recommended_solvables). Suggests are not installed by
         // default, matching dnf behavior.
 
-        // TODO: Supplements and Enhances are reverse weak dependencies.
-        // They require a reverse index and commonly use boolean expressions
-        // (e.g. Supplements: (hunspell and langpacks-el)), which are deferred
-        // until rich/boolean dependency support is implemented.
+        // Supplements and Enhances are reverse weak dependencies. Their data is
+        // parsed and stored, but the reverse index and collection logic are
+        // deferred until rich/boolean dependency support is implemented — real
+        // repos use boolean expressions almost exclusively for these types.
 
         for &vs_id in &pack.conflicts {
             result.constrains.push(vs_id);
@@ -801,6 +841,14 @@ impl DependencyProvider for RpmProvider {
         // that the obsoleting package replaces the obsoleted one during upgrades.
         // This is transaction/installer-level logic, not pure dependency resolution.
         // For now, obsoletes data is not loaded by the solver.
+
+        // Obsoletes are modeled as constrains (same as Conflicts) at the resolver
+        // level: if this package is in the solution, the obsoleted versions are
+        // excluded. The install/transaction-level replacement semantics are not
+        // handled here.
+        for &vs_id in &pack.obsoletes {
+            result.constrains.push(vs_id);
+        }
 
         Dependencies::Known(result)
     }

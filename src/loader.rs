@@ -5,8 +5,8 @@ use rpmrepo_metadata::FileType;
 use rpmrepo_metadata::visitor::{FilelistsVisitor, PrimaryVisitor, RequirementData};
 
 use crate::{
-    HashMap, LoadOptions, PackageSpec, ProvidesMap, ProvidesVersion, RpmPackageVersion, RpmProvider,
-    RpmRequirement, invert_flags,
+    HashMap, LoadOptions, PackageSpec, ProvidesMap, ProvidesVersion, RequirementType,
+    RpmPackageVersion, RpmProvider, RpmRequirement, invert_flags,
 };
 
 use resolvo::{NameId, SolvableId, VersionSetId};
@@ -24,7 +24,11 @@ struct PackageInProgress {
     arch: String,
     requires: Vec<VersionSetId>,
     conflicts: Vec<VersionSetId>,
+    obsoletes: Vec<VersionSetId>,
     recommends: Vec<VersionSetId>,
+    suggests: Vec<VersionSetId>,
+    supplements: Vec<VersionSetId>,
+    enhances: Vec<VersionSetId>,
     /// Provides entries: (interned capability NameId, optional epoch, version, release).
     /// Stored with owned strings because the provides version may differ from the
     /// package EVR and must survive until `end_package` registers them.
@@ -46,7 +50,11 @@ impl PackageInProgress {
             arch: String::new(),
             requires: Vec::new(),
             conflicts: Vec::new(),
+            obsoletes: Vec::new(),
             recommends: Vec::new(),
+            suggests: Vec::new(),
+            supplements: Vec::new(),
+            enhances: Vec::new(),
             provides: Vec::new(),
             file_name_ids: Vec::new(),
         }
@@ -61,7 +69,11 @@ impl PackageInProgress {
         self.arch.clear();
         self.requires.clear();
         self.conflicts.clear();
+        self.obsoletes.clear();
         self.recommends.clear();
+        self.suggests.clear();
+        self.supplements.clear();
+        self.enhances.clear();
         self.provides.clear();
         self.file_name_ids.clear();
     }
@@ -96,12 +108,25 @@ fn intern_inverted_requirement(
     data: &RequirementData<'_>,
 ) -> VersionSetId {
     let name_id = pool.intern_package_name(data.name);
-    let req = RpmRequirement {
-        flags: data.flags.map(invert_flags),
-        epoch: data.epoch.map(|s| pool.intern_string(s)),
-        version: data.version.map(|s| pool.intern_string(s)),
-        release: data.release.map(|s| pool.intern_string(s)),
-        preinstall: data.preinstall,
+    let req = if data.flags.is_none() {
+        // Unversioned conflict/obsoletes: "cannot coexist with ANY version."
+        // Use LT 0:0 — no real package can have version < 0, so filter_candidates
+        // with inverse=true will forbid all candidates.
+        RpmRequirement {
+            flags: Some(RequirementType::LT),
+            epoch: Some(pool.intern_string("0")),
+            version: Some(pool.intern_string("0")),
+            release: None,
+            preinstall: false,
+        }
+    } else {
+        RpmRequirement {
+            flags: data.flags.map(invert_flags),
+            epoch: data.epoch.map(|s| pool.intern_string(s)),
+            version: data.version.map(|s| pool.intern_string(s)),
+            release: data.release.map(|s| pool.intern_string(s)),
+            preinstall: data.preinstall,
+        }
     };
     pool.intern_version_set(name_id, req)
 }
@@ -232,6 +257,25 @@ impl PrimaryVisitor for PrimaryLoaderVisitor<'_> {
         self.pkg.conflicts.push(vs_id);
     }
 
+    /// Record a `<rpm:obsoletes>` entry.
+    ///
+    /// Modeled as `constrains` with inverted version sets, same as Conflicts.
+    /// At the resolver level, if this package is in the solution, the obsoleted
+    /// versions are excluded. The install-level replacement semantics are not
+    /// handled here.
+    ///
+    /// Rich/boolean dependencies (starting with `(`) are skipped.
+    fn add_obsolete(&mut self, req: RequirementData<'_>) {
+        if self.skip {
+            return;
+        }
+        if req.name.starts_with('(') {
+            return;
+        }
+        let vs_id = intern_inverted_requirement(self.pool, &req);
+        self.pkg.obsoletes.push(vs_id);
+    }
+
     /// Record a `<rpm:recommends>` entry as a weak dependency.
     ///
     /// Recommends are not hard requirements — they're collected separately and
@@ -243,12 +287,61 @@ impl PrimaryVisitor for PrimaryLoaderVisitor<'_> {
         if self.skip {
             return;
         }
-        // Skip rich/boolean dependencies — not yet supported by the solver.
         if req.name.starts_with('(') {
             return;
         }
         let vs_id = intern_requirement(self.pool, &req);
         self.pkg.recommends.push(vs_id);
+    }
+
+    /// Record a `<rpm:suggests>` entry as a weak dependency.
+    ///
+    /// Suggests are weaker than Recommends and off by default (matching dnf).
+    ///
+    /// Rich/boolean dependencies (starting with `(`) are skipped.
+    fn add_suggest(&mut self, req: RequirementData<'_>) {
+        if self.skip {
+            return;
+        }
+        if req.name.starts_with('(') {
+            return;
+        }
+        let vs_id = intern_requirement(self.pool, &req);
+        self.pkg.suggests.push(vs_id);
+    }
+
+    /// Record a `<rpm:supplements>` entry.
+    ///
+    /// Data is parsed and stored but the reverse index and collection logic
+    /// are deferred until boolean dependency support is implemented.
+    ///
+    /// Rich/boolean dependencies (starting with `(`) are skipped.
+    fn add_supplement(&mut self, req: RequirementData<'_>) {
+        if self.skip {
+            return;
+        }
+        if req.name.starts_with('(') {
+            return;
+        }
+        let vs_id = intern_requirement(self.pool, &req);
+        self.pkg.supplements.push(vs_id);
+    }
+
+    /// Record a `<rpm:enhances>` entry.
+    ///
+    /// Data is parsed and stored but the reverse index and collection logic
+    /// are deferred until boolean dependency support is implemented.
+    ///
+    /// Rich/boolean dependencies (starting with `(`) are skipped.
+    fn add_enhance(&mut self, req: RequirementData<'_>) {
+        if self.skip {
+            return;
+        }
+        if req.name.starts_with('(') {
+            return;
+        }
+        let vs_id = intern_requirement(self.pool, &req);
+        self.pkg.enhances.push(vs_id);
     }
 
     /// Record a `<file>` element from primary.xml.
@@ -291,7 +384,11 @@ impl PrimaryVisitor for PrimaryLoaderVisitor<'_> {
             repo_id: self.repo_id,
             requires: std::mem::take(&mut self.pkg.requires),
             conflicts: std::mem::take(&mut self.pkg.conflicts),
+            obsoletes: std::mem::take(&mut self.pkg.obsoletes),
             recommends: std::mem::take(&mut self.pkg.recommends),
+            suggests: std::mem::take(&mut self.pkg.suggests),
+            supplements: std::mem::take(&mut self.pkg.supplements),
+            enhances: std::mem::take(&mut self.pkg.enhances),
         };
 
         let solvable = self.pool.intern_solvable(name_id, pack);
@@ -445,8 +542,28 @@ impl RpmProvider {
             .iter()
             .map(|r| intern_inverted_requirement(&self.pool, r))
             .collect();
+        let obsoletes: Vec<_> = spec
+            .obsoletes
+            .iter()
+            .map(|r| intern_inverted_requirement(&self.pool, r))
+            .collect();
         let recommends: Vec<_> = spec
             .recommends
+            .iter()
+            .map(|r| intern_requirement(&self.pool, r))
+            .collect();
+        let suggests: Vec<_> = spec
+            .suggests
+            .iter()
+            .map(|r| intern_requirement(&self.pool, r))
+            .collect();
+        let supplements: Vec<_> = spec
+            .supplements
+            .iter()
+            .map(|r| intern_requirement(&self.pool, r))
+            .collect();
+        let enhances: Vec<_> = spec
+            .enhances
             .iter()
             .map(|r| intern_requirement(&self.pool, r))
             .collect();
@@ -462,7 +579,11 @@ impl RpmProvider {
             repo_id,
             requires,
             conflicts,
+            obsoletes,
             recommends,
+            suggests,
+            supplements,
+            enhances,
         };
 
         let solvable = self.pool.intern_solvable(name_id, pack);

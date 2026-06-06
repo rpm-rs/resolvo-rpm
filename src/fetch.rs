@@ -32,7 +32,7 @@ pub fn fetch_repodata(base_url: Url, target_folder: &Path) {
     let reader = RepositoryReader::new_from_directory(target_folder).unwrap();
     let repomd = reader.repomd();
 
-    let data = repomd.get_filelist_data();
+    let data = repomd.get_filelist_data().unwrap();
     let url = base_url
         .join(&data.location_href.to_string_lossy())
         .unwrap();
@@ -40,7 +40,7 @@ pub fn fetch_repodata(base_url: Url, target_folder: &Path) {
     let mut file = File::create(target_folder.join(&data.location_href)).unwrap();
     io::copy(&mut resp, &mut file).unwrap();
 
-    let data = repomd.get_other_data();
+    let data = repomd.get_other_data().unwrap();
     let url = base_url
         .join(&data.location_href.to_string_lossy())
         .unwrap();
@@ -48,7 +48,7 @@ pub fn fetch_repodata(base_url: Url, target_folder: &Path) {
     let mut file = File::create(target_folder.join(&data.location_href)).unwrap();
     io::copy(&mut resp, &mut file).unwrap();
 
-    let data = repomd.get_primary_data();
+    let data = repomd.get_primary_data().unwrap();
     let url = base_url
         .join(&data.location_href.to_string_lossy())
         .unwrap();

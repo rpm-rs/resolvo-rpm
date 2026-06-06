@@ -35,6 +35,11 @@ enum Command {
         /// if available (matching dnf behavior). This flag skips them entirely.
         #[clap(long)]
         disable_recommends: bool,
+
+        /// Enable Suggests. By default, suggested packages are not installed
+        /// (matching dnf behavior). This flag includes them as soft requirements.
+        #[clap(long)]
+        enable_suggests: bool,
     },
     /// Check that all dependencies within the repos are satisfiable.
     Depclose {
@@ -71,7 +76,14 @@ fn main() {
             packages,
             arch,
             disable_recommends,
-        } => cmd_resolve(&repo, &packages, arch.as_deref(), disable_recommends),
+            enable_suggests,
+        } => cmd_resolve(
+            &repo,
+            &packages,
+            arch.as_deref(),
+            disable_recommends,
+            enable_suggests,
+        ),
         Command::Depclose {
             repo,
             check,
@@ -90,6 +102,7 @@ fn cmd_resolve(
     packages: &[String],
     arch: Option<&str>,
     disable_recommends: bool,
+    enable_suggests: bool,
 ) {
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {
@@ -99,7 +112,9 @@ fn cmd_resolve(
 
     let mut solver = resolvo::Solver::new(provider);
     let pkg_names: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
-    let options = ResolveOptions::new().enable_recommends(!disable_recommends);
+    let options = ResolveOptions::new()
+        .enable_recommends(!disable_recommends)
+        .enable_suggests(enable_suggests);
 
     let solvables = match resolve(&mut solver, &pkg_names, &options) {
         Ok(s) => s,
@@ -166,9 +181,9 @@ fn cmd_depclose(repos: &[PathBuf], check_repos: &[PathBuf], newest: bool, arch: 
     for &(sid, vs_id) in &unsatisfied {
         let pkg_name = provider.package_name(sid);
         let pkg_version = provider.package_version(sid).to_string();
-        let req_name = provider.pool.resolve_package_name(
-            provider.pool.resolve_version_set_package_name(vs_id),
-        );
+        let req_name = provider
+            .pool
+            .resolve_package_name(provider.pool.resolve_version_set_package_name(vs_id));
         let vs = provider.pool.resolve_version_set(vs_id);
         let ver_str = vs.version.map(|id| provider.pool.resolve_string(id));
         let req_display = match (vs.flags, ver_str) {
