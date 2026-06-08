@@ -31,6 +31,7 @@ use resolvo::{
 };
 use rpm_version::Evr;
 pub use rpmrepo_metadata::RequirementType;
+pub use rpmrepo_metadata::{CompsGroup, CompsPackageReq};
 use std::{cell::RefCell, cmp::Ordering, fmt::Display, hash::Hash, path::PathBuf};
 
 type HashMap<K, V> = ahash::AHashMap<K, V>;
@@ -499,11 +500,13 @@ pub fn make_install_requirements(
 /// ```
 /// use resolvo_rpm::LoadOptions;
 ///
-/// let opts = LoadOptions::new().load_filelists(true);
+/// let opts = LoadOptions::new().load_filelists(true).load_groups(true);
 /// ```
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub(crate) load_filelists: bool,
+    pub(crate) load_groups: bool,
+    pub(crate) group_options: GroupInstallOptions,
 }
 
 impl LoadOptions {
@@ -522,12 +525,83 @@ impl LoadOptions {
         self.load_filelists = load;
         self
     }
+
+    /// Set whether comps.xml (package group metadata) should be parsed during
+    /// [`RpmProvider::load_repo()`].
+    ///
+    /// When true, groups are loaded and registered as virtual solvables
+    /// named `@group-id`. When false (the default), group metadata is ignored.
+    pub fn load_groups(mut self, load: bool) -> Self {
+        self.load_groups = load;
+        self
+    }
+
+    /// Set which package types within groups are included as requirements.
+    ///
+    /// Only meaningful when [`load_groups`](Self::load_groups) is true.
+    /// Defaults to [`GroupInstallOptions::default()`] (mandatory + default).
+    pub fn group_options(mut self, options: GroupInstallOptions) -> Self {
+        self.group_options = options;
+        self
+    }
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             load_filelists: false,
+            load_groups: false,
+            group_options: GroupInstallOptions::default(),
+        }
+    }
+}
+
+/// Options controlling which package types within a group are included.
+///
+/// RPM comps groups categorize their packages as mandatory, default, or
+/// optional. This struct controls which categories are pulled in as
+/// requirements of the virtual group solvable.
+///
+/// Defaults match dnf's `groupinstall`: mandatory and default are included,
+/// optional is excluded.
+#[derive(Debug, Clone)]
+pub struct GroupInstallOptions {
+    pub(crate) include_mandatory: bool,
+    pub(crate) include_default: bool,
+    pub(crate) include_optional: bool,
+}
+
+impl GroupInstallOptions {
+    /// Create options with default settings (mandatory + default included).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set whether mandatory packages are included.
+    pub fn include_mandatory(mut self, include: bool) -> Self {
+        self.include_mandatory = include;
+        self
+    }
+
+    /// Set whether default packages are included.
+    pub fn include_default(mut self, include: bool) -> Self {
+        self.include_default = include;
+        self
+    }
+
+    /// Set whether optional packages are included.
+    pub fn include_optional(mut self, include: bool) -> Self {
+        self.include_optional = include;
+        self
+    }
+}
+
+impl Default for GroupInstallOptions {
+    fn default() -> Self {
+        Self {
+            include_mandatory: true,
+            include_default: true,
+            include_optional: false,
         }
     }
 }

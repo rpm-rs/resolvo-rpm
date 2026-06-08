@@ -2,11 +2,11 @@ use std::path::Path;
 
 use resolvo::utils::Pool;
 use rpmrepo_metadata::FileType;
-use rpmrepo_metadata::visitor::{FilelistsVisitor, PrimaryVisitor, RequirementData};
+use rpmrepo_metadata::visitor::{CompsVisitor, FilelistsVisitor, PrimaryVisitor, RequirementData};
 
 use crate::{
-    HashMap, LoadOptions, PackageSpec, ProvidesMap, ProvidesVersion, RequirementType,
-    RpmPackageVersion, RpmProvider, RpmRequirement, invert_flags,
+    GroupInstallOptions, HashMap, LoadOptions, PackageSpec, ProvidesMap, ProvidesVersion,
+    RequirementType, RpmPackageVersion, RpmProvider, RpmRequirement, invert_flags,
 };
 
 use resolvo::{NameId, SolvableId, VersionSetId};
@@ -461,6 +461,99 @@ impl FilelistsVisitor for FilelistsLoaderVisitor<'_> {
     }
 }
 
+/// Visitor that streams comps.xml and collects group definitions.
+///
+/// Accumulates each `<group>` element into a `CompsGroup`, then pushes
+/// the completed group onto the output vec in `end_group`. Categories,
+/// environments, and langpacks are ignored — only groups are collected.
+struct GroupLoaderVisitor<'a> {
+    current_group: Option<rpmrepo_metadata::CompsGroup>,
+    groups: &'a mut Vec<rpmrepo_metadata::CompsGroup>,
+}
+
+impl CompsVisitor for GroupLoaderVisitor<'_> {
+    fn begin_group(&mut self) {
+        self.current_group = Some(rpmrepo_metadata::CompsGroup::default());
+    }
+
+    fn set_group_id(&mut self, id: &str) {
+        if let Some(g) = &mut self.current_group {
+            g.id = id.to_owned();
+        }
+    }
+
+    fn set_group_name(&mut self, name: &str, lang: Option<&str>) {
+        if let Some(g) = &mut self.current_group {
+            match lang {
+                None => g.name = name.to_owned(),
+                Some(l) => g.name_by_lang.push((l.to_owned(), name.to_owned())),
+            }
+        }
+    }
+
+    fn set_group_description(&mut self, desc: &str, lang: Option<&str>) {
+        if let Some(g) = &mut self.current_group {
+            match lang {
+                None => g.description = desc.to_owned(),
+                Some(l) => g.desc_by_lang.push((l.to_owned(), desc.to_owned())),
+            }
+        }
+    }
+
+    fn set_group_default(&mut self, default: bool) {
+        if let Some(g) = &mut self.current_group {
+            g.default = default;
+        }
+    }
+
+    fn set_group_uservisible(&mut self, visible: bool) {
+        if let Some(g) = &mut self.current_group {
+            g.uservisible = visible;
+        }
+    }
+
+    fn set_group_biarchonly(&mut self, biarchonly: bool) {
+        if let Some(g) = &mut self.current_group {
+            g.biarchonly = biarchonly;
+        }
+    }
+
+    fn set_group_langonly(&mut self, langonly: &str) {
+        if let Some(g) = &mut self.current_group {
+            g.langonly = Some(langonly.to_owned());
+        }
+    }
+
+    fn set_group_display_order(&mut self, order: u32) {
+        if let Some(g) = &mut self.current_group {
+            g.display_order = Some(order);
+        }
+    }
+
+    fn add_group_package(
+        &mut self,
+        name: &str,
+        reqtype: &str,
+        requires: Option<&str>,
+        basearchonly: bool,
+    ) {
+        if let Some(g) = &mut self.current_group {
+            g.packages.push(rpmrepo_metadata::CompsPackageReq {
+                name: name.to_owned(),
+                reqtype: reqtype.to_owned(),
+                requires: requires.map(|s| s.to_owned()),
+                basearchonly,
+            });
+        }
+    }
+
+    fn end_group(&mut self) {
+        if let Some(g) = self.current_group.take() {
+            self.groups.push(g);
+        }
+    }
+}
+
 impl RpmProvider {
     /// Load RPM repository metadata from a local directory with default options.
     ///
@@ -515,6 +608,28 @@ impl RpmProvider {
                 rpmrepo_metadata::visitor::parse_filelists(&mut xml_reader, &mut visitor).unwrap();
             } else {
                 self.filelists_paths.push(filelists_path);
+            }
+        }
+
+        // Must drop the provides_map borrow before add_group takes &mut self.
+        drop(provides_map);
+
+        if options.load_groups {
+            if let Some(group_record) = repomd.get_record("group") {
+                let group_path = path.join(&group_record.location_href);
+                let mut xml_reader =
+                    rpmrepo_metadata::utils::xml_reader_from_file(&group_path).unwrap();
+
+                let mut groups: Vec<rpmrepo_metadata::CompsGroup> = Vec::new();
+                let mut visitor = GroupLoaderVisitor {
+                    current_group: None,
+                    groups: &mut groups,
+                };
+                rpmrepo_metadata::visitor::parse_comps(&mut xml_reader, &mut visitor).unwrap();
+
+                for group in &groups {
+                    self.add_group(repo_id, group, &options.group_options);
+                }
             }
         }
     }
@@ -615,6 +730,78 @@ impl RpmProvider {
             let file_id = self.pool.intern_package_name(file_path);
             provides_map.entry(file_id).push(solvable);
         }
+
+        solvable
+    }
+
+    /// Add a package group as a virtual solvable in the solver pool.
+    ///
+    /// Creates a solvable named `@{group_id}` (e.g. `@core`) whose Requires
+    /// are the packages in the group matching the selected package types.
+    /// By default, mandatory and default packages are included; optional
+    /// packages are excluded (matching dnf's `groupinstall` behavior).
+    /// Use [`GroupInstallOptions`] to customize which types are included.
+    ///
+    /// The virtual solvable uses version `1.0-1` and arch `noarch`. It can
+    /// be resolved like any other package by passing `@group-id` to
+    /// [`resolve()`](crate::resolve).
+    ///
+    /// Conditional packages (those with a `requires` field in comps.xml) are
+    /// skipped.
+    pub fn add_group(
+        &mut self,
+        repo_id: usize,
+        group: &rpmrepo_metadata::CompsGroup,
+        options: &GroupInstallOptions,
+    ) -> SolvableId {
+        let virtual_name = format!("@{}", group.id);
+        let name_id = self.pool.intern_package_name(&virtual_name);
+
+        let requires: Vec<VersionSetId> = group
+            .packages
+            .iter()
+            .filter(|p| {
+                p.requires.is_none()
+                    && match p.reqtype.as_str() {
+                        "mandatory" => options.include_mandatory,
+                        "default" => options.include_default,
+                        "optional" => options.include_optional,
+                        _ => false,
+                    }
+            })
+            .map(|p| {
+                let pkg_name_id = self.pool.intern_package_name(&p.name);
+                let req = RpmRequirement {
+                    flags: None,
+                    epoch: None,
+                    version: None,
+                    release: None,
+                    preinstall: false,
+                };
+                self.pool.intern_version_set(pkg_name_id, req)
+            })
+            .collect();
+
+        let pack = RpmPackageVersion {
+            name: virtual_name,
+            epoch: "0".to_owned(),
+            version: "1.0".to_owned(),
+            release: "1".to_owned(),
+            arch: "noarch".to_owned(),
+            repo_id,
+            requires,
+            conflicts: Vec::new(),
+            obsoletes: Vec::new(),
+            recommends: Vec::new(),
+            suggests: Vec::new(),
+            supplements: Vec::new(),
+            enhances: Vec::new(),
+        };
+
+        let solvable = self.pool.intern_solvable(name_id, pack);
+
+        let mut provides_map = self.provides_to_package.borrow_mut();
+        provides_map.entry(name_id).push(solvable);
 
         solvable
     }

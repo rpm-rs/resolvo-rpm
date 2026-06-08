@@ -1,4 +1,4 @@
-use resolvo_rpm::{ClosureOptions, ResolveOptions, RpmProvider, resolve};
+use resolvo_rpm::{ClosureOptions, LoadOptions, ResolveOptions, RpmProvider, resolve};
 use std::{collections::BTreeSet, path::PathBuf, process};
 
 use clap::{Parser, Subcommand};
@@ -22,7 +22,8 @@ enum Command {
         #[clap(long, required = true)]
         repo: Vec<PathBuf>,
 
-        /// Package names to resolve dependencies for.
+        /// Package names or @group-ids to resolve dependencies for.
+        /// Group names must be prefixed with @ (e.g. @core, @development).
         #[clap(required = true)]
         packages: Vec<String>,
 
@@ -104,10 +105,14 @@ fn cmd_resolve(
     disable_recommends: bool,
     enable_suggests: bool,
 ) {
+    let has_groups = packages.iter().any(|p| p.starts_with('@'));
+
+    let load_options = LoadOptions::new().load_groups(has_groups);
+
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {
         let repo_label = &repo_path.display().to_string();
-        provider.load_repo(repo_path, repo_label);
+        provider.load_repo_with_options(repo_path, repo_label, &load_options);
     }
 
     let mut solver = resolvo::Solver::new(provider);
