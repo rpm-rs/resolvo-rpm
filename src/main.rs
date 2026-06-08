@@ -1,4 +1,7 @@
-use resolvo_rpm::{ClosureOptions, LoadOptions, ResolveOptions, RpmProvider, resolve};
+use resolvo_rpm::{
+    ClosureOptions, LoadOptions, ResolveOptions, RpmProvider, UpdateRecord, resolve,
+};
+use rpm_version::Evr;
 use std::{collections::BTreeSet, path::PathBuf, process};
 
 use clap::{Parser, Subcommand};
@@ -43,6 +46,40 @@ enum Command {
         #[clap(long)]
         enable_suggests: bool,
     },
+    /// Query the advisory (updateinfo) index.
+    ///
+    /// Lists advisories matching the given filters, or shows detail for a
+    /// single advisory when --id is given. Filters are combined with AND.
+    Query {
+        /// Paths to local repodata directories (must contain repodata/repomd.xml).
+        /// Can be specified multiple times.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture for filtering packages.
+        #[clap(long)]
+        arch: Option<String>,
+
+        /// Show full detail for a single advisory by ID.
+        #[clap(long)]
+        id: Option<String>,
+
+        /// Filter advisories by affected package name.
+        #[clap(long)]
+        package: Option<String>,
+
+        /// Filter advisories by CVE reference.
+        #[clap(long)]
+        cve: Option<String>,
+
+        /// Filter advisories by type (security, bugfix, enhancement).
+        #[clap(long = "type")]
+        advisory_type: Option<String>,
+
+        /// Filter advisories by severity (Critical, Important, Moderate, Low).
+        #[clap(long)]
+        severity: Option<String>,
+    },
     /// Check that all dependencies within the repos are satisfiable.
     Depclose {
         /// Paths to local repodata directories (must contain repodata/repomd.xml).
@@ -85,6 +122,23 @@ fn main() {
             arch.as_deref(),
             disable_recommends,
             enable_suggests,
+        ),
+        Command::Query {
+            repo,
+            arch,
+            id,
+            package,
+            cve,
+            advisory_type,
+            severity,
+        } => cmd_query(
+            &repo,
+            arch.as_deref(),
+            id.as_deref(),
+            package.as_deref(),
+            cve.as_deref(),
+            advisory_type.as_deref(),
+            severity.as_deref(),
         ),
         Command::Depclose {
             repo,
@@ -131,6 +185,150 @@ fn cmd_resolve(
     };
 
     print_resolution(&solver, &solvables);
+}
+
+/// Query the advisory index, listing or showing detail for advisories.
+fn cmd_query(
+    repos: &[PathBuf],
+    arch: Option<&str>,
+    id: Option<&str>,
+    package: Option<&str>,
+    cve: Option<&str>,
+    advisory_type: Option<&str>,
+    severity: Option<&str>,
+) {
+    let load_options = LoadOptions::new().load_advisories(true);
+
+    let mut provider = RpmProvider::new(arch);
+    for repo_path in repos {
+        let repo_label = &repo_path.display().to_string();
+        provider.load_repo_with_options(repo_path, repo_label, &load_options);
+    }
+
+    if let Some(advisory_id) = id {
+        match provider.advisory_by_id(advisory_id) {
+            Some(advisory) => print_advisory_detail(advisory),
+            None => {
+                eprintln!("Advisory not found: {}", advisory_id);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let mut results: Vec<&UpdateRecord> = provider.advisories().iter().collect();
+
+    if let Some(pkg) = package {
+        let pkg_set: std::collections::HashSet<&str> = provider
+            .advisories_for_package(pkg)
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        results.retain(|a| pkg_set.contains(a.id.as_str()));
+    }
+
+    if let Some(cve_id) = cve {
+        let cve_set: std::collections::HashSet<&str> = provider
+            .advisories_by_cve(cve_id)
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        results.retain(|a| cve_set.contains(a.id.as_str()));
+    }
+
+    if let Some(atype) = advisory_type {
+        results.retain(|a| a.update_type == atype);
+    }
+
+    if let Some(sev) = severity {
+        results.retain(|a| a.severity.as_deref() == Some(sev));
+    }
+
+    if results.is_empty() {
+        eprintln!("No advisories found.");
+        return;
+    }
+
+    let id_width = results.iter().map(|a| a.id.len()).max().unwrap_or(0);
+    let type_width = results
+        .iter()
+        .map(|a| a.update_type.len())
+        .max()
+        .unwrap_or(0);
+    let sev_width = results
+        .iter()
+        .map(|a| a.severity.as_deref().unwrap_or("").len())
+        .max()
+        .unwrap_or(0);
+
+    for advisory in &results {
+        let sev = advisory.severity.as_deref().unwrap_or("");
+        println!(
+            "{:<iw$}  {:<tw$}  {:<sw$}  {}",
+            advisory.id,
+            advisory.update_type,
+            sev,
+            advisory.title,
+            iw = id_width,
+            tw = type_width,
+            sw = sev_width,
+        );
+    }
+
+    eprintln!("\n{} advisories", results.len());
+}
+
+/// Print full detail for a single advisory.
+fn print_advisory_detail(advisory: &UpdateRecord) {
+    let sev = advisory.severity.as_deref().unwrap_or("None");
+    println!("{}  {}  {}", advisory.id, advisory.update_type, sev);
+    println!("{}", advisory.title);
+
+    if let Some(date) = &advisory.issued_date {
+        println!("Issued:  {}", date);
+    }
+    if let Some(date) = &advisory.updated_date {
+        println!("Updated: {}", date);
+    }
+
+    let cve_refs: Vec<_> = advisory
+        .references
+        .iter()
+        .filter(|r| r.reftype == "cve")
+        .collect();
+    if !cve_refs.is_empty() {
+        println!("\nReferences:");
+        let id_width = cve_refs
+            .iter()
+            .map(|r| r.id.as_deref().unwrap_or("").len())
+            .max()
+            .unwrap_or(0);
+        for r in &cve_refs {
+            let ref_id = r.id.as_deref().unwrap_or("");
+            println!("  {:<w$}  {}", ref_id, r.href, w = id_width);
+        }
+    }
+
+    let packages: Vec<_> = advisory.pkglist.iter().flat_map(|c| &c.packages).collect();
+    if !packages.is_empty() {
+        println!("\nPackages:");
+        let name_width = packages.iter().map(|p| p.name.len()).max().unwrap_or(0);
+        let evrs: Vec<String> = packages
+            .iter()
+            .map(|p| Evr::new(&p.epoch, &p.version, &p.release).to_string())
+            .collect();
+        let evr_width = evrs.iter().map(|e| e.len()).max().unwrap_or(0);
+        for (p, evr) in packages.iter().zip(&evrs) {
+            println!(
+                "  {:<nw$}  {:<ew$}  {}",
+                p.name,
+                evr,
+                p.arch,
+                nw = name_width,
+                ew = evr_width,
+            );
+        }
+    }
 }
 
 /// Check dependency closure: verify that every Requires of every package
