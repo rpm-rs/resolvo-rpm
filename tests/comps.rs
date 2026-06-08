@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use resolvo_rpm::{
-    CompsGroup, CompsPackageReq, DependencySpec, GroupInstallOptions, LoadOptions, PackageSpec,
-    ResolveOptions, RpmProvider, resolve,
+    CompsEnvironment, CompsEnvironmentOption, CompsGroup, CompsPackageReq, DependencySpec,
+    EnvironmentInstallOptions, GroupInstallOptions, LoadOptions, PackageSpec, ResolveOptions,
+    RpmProvider, resolve,
 };
 
 mod common;
@@ -301,5 +302,224 @@ fn group_mixed_with_packages() {
 
     assert!(names.contains("@my-group"));
     assert!(names.contains("group-member"));
+    assert!(names.contains("standalone-pkg"));
+}
+
+// --- Environment tests ---
+
+/// Helper: build a CompsEnvironment with the given id, mandatory groups, and options.
+fn make_environment(
+    id: &str,
+    group_ids: Vec<&str>,
+    option_ids: Vec<(&str, bool)>,
+) -> CompsEnvironment {
+    CompsEnvironment {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        group_ids: group_ids.into_iter().map(|s| s.to_owned()).collect(),
+        option_ids: option_ids
+            .into_iter()
+            .map(|(gid, default)| CompsEnvironmentOption {
+                group_id: gid.to_owned(),
+                default,
+            })
+            .collect(),
+        ..CompsEnvironment::default()
+    }
+}
+
+/// Helper: add a group with one mandatory package to the provider.
+fn add_simple_group(provider: &mut RpmProvider, repo_id: usize, group_id: &str, pkg_name: &str) {
+    add_simple_package(provider, repo_id, pkg_name);
+    let group = make_group(group_id, vec![make_pkg_req(pkg_name, "mandatory")]);
+    provider.add_group(repo_id, &group, &GroupInstallOptions::default());
+}
+
+#[test]
+fn add_environment_resolves_mandatory_groups() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_simple_group(&mut provider, repo, "base", "base-pkg");
+    add_simple_group(&mut provider, repo, "core", "core-pkg");
+
+    let env = make_environment("test-env", vec!["base", "core"], vec![]);
+    provider.add_environment(repo, &env, &EnvironmentInstallOptions::default());
+
+    let mut solver = resolvo::Solver::new(provider);
+    let result = resolve(&mut solver, &["@test-env"], &ResolveOptions::new()).unwrap();
+    let names: BTreeSet<&str> = result
+        .iter()
+        .map(|s| solver.provider().package_name(*s))
+        .collect();
+
+    assert!(names.contains("@test-env"));
+    assert!(names.contains("@base"));
+    assert!(names.contains("@core"));
+    assert!(names.contains("base-pkg"));
+    assert!(names.contains("core-pkg"));
+}
+
+#[test]
+fn add_environment_includes_default_option_groups() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_simple_group(&mut provider, repo, "base", "base-pkg");
+    add_simple_group(&mut provider, repo, "extras", "extras-pkg");
+
+    let env = make_environment("test-env", vec!["base"], vec![("extras", true)]);
+    provider.add_environment(repo, &env, &EnvironmentInstallOptions::default());
+
+    let mut solver = resolvo::Solver::new(provider);
+    let result = resolve(&mut solver, &["@test-env"], &ResolveOptions::new()).unwrap();
+    let names: BTreeSet<&str> = result
+        .iter()
+        .map(|s| solver.provider().package_name(*s))
+        .collect();
+
+    assert!(names.contains("@base"));
+    assert!(
+        names.contains("@extras"),
+        "default optional groups should be included"
+    );
+    assert!(names.contains("extras-pkg"));
+}
+
+#[test]
+fn add_environment_excludes_non_default_option_groups() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_simple_group(&mut provider, repo, "base", "base-pkg");
+    add_simple_group(&mut provider, repo, "games", "games-pkg");
+
+    let env = make_environment("test-env", vec!["base"], vec![("games", false)]);
+    provider.add_environment(repo, &env, &EnvironmentInstallOptions::default());
+
+    let mut solver = resolvo::Solver::new(provider);
+    let result = resolve(&mut solver, &["@test-env"], &ResolveOptions::new()).unwrap();
+    let names: BTreeSet<&str> = result
+        .iter()
+        .map(|s| solver.provider().package_name(*s))
+        .collect();
+
+    assert!(names.contains("@base"));
+    assert!(
+        !names.contains("@games"),
+        "non-default optional groups should be excluded"
+    );
+    assert!(!names.contains("games-pkg"));
+}
+
+#[test]
+fn add_environment_includes_all_options_when_requested() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_simple_group(&mut provider, repo, "base", "base-pkg");
+    add_simple_group(&mut provider, repo, "games", "games-pkg");
+    add_simple_group(&mut provider, repo, "extras", "extras-pkg");
+
+    let env = make_environment(
+        "test-env",
+        vec!["base"],
+        vec![("games", false), ("extras", true)],
+    );
+    let options = EnvironmentInstallOptions::new().include_all_options(true);
+    provider.add_environment(repo, &env, &options);
+
+    let mut solver = resolvo::Solver::new(provider);
+    let result = resolve(&mut solver, &["@test-env"], &ResolveOptions::new()).unwrap();
+    let names: BTreeSet<&str> = result
+        .iter()
+        .map(|s| solver.provider().package_name(*s))
+        .collect();
+
+    assert!(names.contains("@base"));
+    assert!(
+        names.contains("@games"),
+        "all optional groups should be included when requested"
+    );
+    assert!(
+        names.contains("@extras"),
+        "all optional groups should be included when requested"
+    );
+}
+
+#[test]
+fn load_environments_from_repo() {
+    let load_options = LoadOptions::new().load_groups(true);
+
+    let mut provider = RpmProvider::new(Some("x86_64"));
+    provider.load_repo_with_options(
+        &common::repo_path("cs10-baseos"),
+        "cs10-baseos",
+        &load_options,
+    );
+    provider.load_repo_with_options(
+        &common::repo_path("cs10-appstream"),
+        "cs10-appstream",
+        &load_options,
+    );
+
+    let mut solver = resolvo::Solver::new(provider);
+
+    let result = resolve(
+        &mut solver,
+        &["@minimal-environment"],
+        &ResolveOptions::new(),
+    )
+    .unwrap();
+    let names: BTreeSet<&str> = result
+        .iter()
+        .map(|s| solver.provider().package_name(*s))
+        .collect();
+
+    assert!(
+        names.contains("@minimal-environment"),
+        "the @minimal-environment virtual package should be in the result"
+    );
+    assert!(
+        names.contains("@core"),
+        "the minimal environment should include the core group"
+    );
+    assert!(
+        names.len() > 10,
+        "the minimal environment should pull in many packages, got {}",
+        names.len()
+    );
+}
+
+#[test]
+fn environment_mixed_with_packages_and_groups() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_simple_group(&mut provider, repo, "base", "base-pkg");
+    add_simple_group(&mut provider, repo, "extra", "extra-pkg");
+    add_simple_package(&mut provider, repo, "standalone-pkg");
+
+    let env = make_environment("test-env", vec!["base"], vec![]);
+    provider.add_environment(repo, &env, &EnvironmentInstallOptions::default());
+
+    let mut solver = resolvo::Solver::new(provider);
+
+    let result = resolve(
+        &mut solver,
+        &["@test-env", "@extra", "standalone-pkg"],
+        &ResolveOptions::new(),
+    )
+    .unwrap();
+    let names: BTreeSet<&str> = result
+        .iter()
+        .map(|s| solver.provider().package_name(*s))
+        .collect();
+
+    assert!(names.contains("@test-env"));
+    assert!(names.contains("@base"));
+    assert!(names.contains("base-pkg"));
+    assert!(names.contains("@extra"));
+    assert!(names.contains("extra-pkg"));
     assert!(names.contains("standalone-pkg"));
 }

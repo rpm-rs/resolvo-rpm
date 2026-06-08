@@ -32,8 +32,8 @@ use resolvo::{
 use rpm_version::Evr;
 pub use rpmrepo_metadata::RequirementType;
 pub use rpmrepo_metadata::{
-    CompsGroup, CompsPackageReq, UpdateCollection, UpdateCollectionPackage, UpdateRecord,
-    UpdateReference,
+    CompsEnvironment, CompsEnvironmentOption, CompsGroup, CompsPackageReq, UpdateCollection,
+    UpdateCollectionPackage, UpdateRecord, UpdateReference,
 };
 use std::{cell::RefCell, cmp::Ordering, fmt::Display, hash::Hash, path::PathBuf};
 
@@ -275,6 +275,10 @@ pub struct RpmProvider {
     advisory_pkg_index: HashMap<String, Vec<usize>>,
     /// Maps CVE ID to the indices of advisories that reference it.
     advisory_cve_index: HashMap<String, Vec<usize>>,
+    /// All loaded comps groups, in insertion order.
+    groups: Vec<CompsGroup>,
+    /// All loaded comps environments, in insertion order.
+    environments: Vec<CompsEnvironment>,
 }
 
 impl RpmProvider {
@@ -298,6 +302,8 @@ impl RpmProvider {
             advisory_id_to_index: HashMap::new(),
             advisory_pkg_index: HashMap::new(),
             advisory_cve_index: HashMap::new(),
+            groups: Vec::new(),
+            environments: Vec::new(),
         }
     }
 
@@ -479,6 +485,16 @@ impl RpmProvider {
             .unwrap_or_default()
     }
 
+    /// Return all loaded comps groups.
+    pub fn groups(&self) -> &[CompsGroup] {
+        &self.groups
+    }
+
+    /// Return all loaded comps environments.
+    pub fn environments(&self) -> &[CompsEnvironment] {
+        &self.environments
+    }
+
     /// Check whether a solvable satisfies a version set (requirement).
     ///
     /// If the solvable has an explicit provides version for the capability
@@ -558,6 +574,7 @@ pub struct LoadOptions {
     pub(crate) load_filelists: bool,
     pub(crate) load_groups: bool,
     pub(crate) group_options: GroupInstallOptions,
+    pub(crate) environment_options: EnvironmentInstallOptions,
     pub(crate) load_advisories: bool,
 }
 
@@ -597,6 +614,15 @@ impl LoadOptions {
         self
     }
 
+    /// Set which optional groups within environments are included as requirements.
+    ///
+    /// Only meaningful when [`load_groups`](Self::load_groups) is true.
+    /// Defaults to [`EnvironmentInstallOptions::default()`] (mandatory + default-flagged optional groups).
+    pub fn environment_options(mut self, options: EnvironmentInstallOptions) -> Self {
+        self.environment_options = options;
+        self
+    }
+
     /// Set whether updateinfo.xml (advisory/errata metadata) should be parsed
     /// during [`RpmProvider::load_repo()`].
     ///
@@ -617,6 +643,7 @@ impl Default for LoadOptions {
             load_filelists: false,
             load_groups: false,
             group_options: GroupInstallOptions::default(),
+            environment_options: EnvironmentInstallOptions::default(),
             load_advisories: false,
         }
     }
@@ -668,6 +695,50 @@ impl Default for GroupInstallOptions {
             include_mandatory: true,
             include_default: true,
             include_optional: false,
+        }
+    }
+}
+
+/// Options controlling which optional groups within an environment are included.
+///
+/// Comps environments have a mandatory group list (always included) and an
+/// optional group list where each entry carries a `default` flag. This struct
+/// controls which optional groups are pulled in as requirements of the virtual
+/// environment solvable.
+///
+/// Defaults match dnf's `environment install`: mandatory groups are always
+/// included, optional groups marked `default: true` are included, and
+/// non-default optional groups are excluded.
+#[derive(Debug, Clone)]
+pub struct EnvironmentInstallOptions {
+    pub(crate) include_default_options: bool,
+    pub(crate) include_all_options: bool,
+}
+
+impl EnvironmentInstallOptions {
+    /// Create options with default settings (mandatory + default-flagged optional groups).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set whether optional groups marked `default: true` are included.
+    pub fn include_default_options(mut self, include: bool) -> Self {
+        self.include_default_options = include;
+        self
+    }
+
+    /// Set whether all optional groups are included, regardless of their default flag.
+    pub fn include_all_options(mut self, include: bool) -> Self {
+        self.include_all_options = include;
+        self
+    }
+}
+
+impl Default for EnvironmentInstallOptions {
+    fn default() -> Self {
+        Self {
+            include_default_options: true,
+            include_all_options: false,
         }
     }
 }

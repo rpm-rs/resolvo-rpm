@@ -7,8 +7,8 @@ use rpmrepo_metadata::visitor::{
 };
 
 use crate::{
-    GroupInstallOptions, HashMap, LoadOptions, PackageSpec, ProvidesMap, ProvidesVersion,
-    RequirementType, RpmPackageVersion, RpmProvider, RpmRequirement, invert_flags,
+    EnvironmentInstallOptions, GroupInstallOptions, HashMap, LoadOptions, PackageSpec, ProvidesMap,
+    ProvidesVersion, RequirementType, RpmPackageVersion, RpmProvider, RpmRequirement, invert_flags,
 };
 
 use resolvo::{NameId, SolvableId, VersionSetId};
@@ -463,17 +463,20 @@ impl FilelistsVisitor for FilelistsLoaderVisitor<'_> {
     }
 }
 
-/// Visitor that streams comps.xml and collects group definitions.
+/// Visitor that streams comps.xml and collects group and environment definitions.
 ///
-/// Accumulates each `<group>` element into a `CompsGroup`, then pushes
-/// the completed group onto the output vec in `end_group`. Categories,
-/// environments, and langpacks are ignored — only groups are collected.
-struct GroupLoaderVisitor<'a> {
+/// Accumulates each `<group>` element into a `CompsGroup` and each
+/// `<environment>` element into a `CompsEnvironment`, pushing completed
+/// items onto their respective output vecs. Categories and langpacks are
+/// ignored.
+struct CompsLoaderVisitor<'a> {
     current_group: Option<rpmrepo_metadata::CompsGroup>,
     groups: &'a mut Vec<rpmrepo_metadata::CompsGroup>,
+    current_environment: Option<rpmrepo_metadata::CompsEnvironment>,
+    environments: &'a mut Vec<rpmrepo_metadata::CompsEnvironment>,
 }
 
-impl CompsVisitor for GroupLoaderVisitor<'_> {
+impl CompsVisitor for CompsLoaderVisitor<'_> {
     fn begin_group(&mut self) {
         self.current_group = Some(rpmrepo_metadata::CompsGroup::default());
     }
@@ -552,6 +555,61 @@ impl CompsVisitor for GroupLoaderVisitor<'_> {
     fn end_group(&mut self) {
         if let Some(g) = self.current_group.take() {
             self.groups.push(g);
+        }
+    }
+
+    fn begin_environment(&mut self) {
+        self.current_environment = Some(rpmrepo_metadata::CompsEnvironment::default());
+    }
+
+    fn set_environment_id(&mut self, id: &str) {
+        if let Some(e) = &mut self.current_environment {
+            e.id = id.to_owned();
+        }
+    }
+
+    fn set_environment_name(&mut self, name: &str, lang: Option<&str>) {
+        if let Some(e) = &mut self.current_environment {
+            match lang {
+                None => e.name = name.to_owned(),
+                Some(l) => e.name_by_lang.push((l.to_owned(), name.to_owned())),
+            }
+        }
+    }
+
+    fn set_environment_description(&mut self, desc: &str, lang: Option<&str>) {
+        if let Some(e) = &mut self.current_environment {
+            match lang {
+                None => e.description = desc.to_owned(),
+                Some(l) => e.desc_by_lang.push((l.to_owned(), desc.to_owned())),
+            }
+        }
+    }
+
+    fn set_environment_display_order(&mut self, order: u32) {
+        if let Some(e) = &mut self.current_environment {
+            e.display_order = Some(order);
+        }
+    }
+
+    fn add_environment_group_id(&mut self, group_id: &str) {
+        if let Some(e) = &mut self.current_environment {
+            e.group_ids.push(group_id.to_owned());
+        }
+    }
+
+    fn add_environment_option_id(&mut self, group_id: &str, default: bool) {
+        if let Some(e) = &mut self.current_environment {
+            e.option_ids.push(rpmrepo_metadata::CompsEnvironmentOption {
+                group_id: group_id.to_owned(),
+                default,
+            });
+        }
+    }
+
+    fn end_environment(&mut self) {
+        if let Some(e) = self.current_environment.take() {
+            self.environments.push(e);
         }
     }
 }
@@ -720,15 +778,23 @@ impl RpmProvider {
                     rpmrepo_metadata::utils::xml_reader_from_file(&group_path).unwrap();
 
                 let mut groups: Vec<rpmrepo_metadata::CompsGroup> = Vec::new();
-                let mut visitor = GroupLoaderVisitor {
+                let mut environments: Vec<rpmrepo_metadata::CompsEnvironment> = Vec::new();
+                let mut visitor = CompsLoaderVisitor {
                     current_group: None,
                     groups: &mut groups,
+                    current_environment: None,
+                    environments: &mut environments,
                 };
                 rpmrepo_metadata::visitor::parse_comps(&mut xml_reader, &mut visitor).unwrap();
 
                 for group in &groups {
                     self.add_group(repo_id, group, &options.group_options);
                 }
+                for env in &environments {
+                    self.add_environment(repo_id, env, &options.environment_options);
+                }
+                self.groups.extend(groups);
+                self.environments.extend(environments);
             }
         }
 
@@ -901,6 +967,76 @@ impl RpmProvider {
                 self.pool.intern_version_set(pkg_name_id, req)
             })
             .collect();
+
+        let pack = RpmPackageVersion {
+            name: virtual_name,
+            epoch: "0".to_owned(),
+            version: "1.0".to_owned(),
+            release: "1".to_owned(),
+            arch: "noarch".to_owned(),
+            repo_id,
+            requires,
+            conflicts: Vec::new(),
+            obsoletes: Vec::new(),
+            recommends: Vec::new(),
+            suggests: Vec::new(),
+            supplements: Vec::new(),
+            enhances: Vec::new(),
+        };
+
+        let solvable = self.pool.intern_solvable(name_id, pack);
+
+        let mut provides_map = self.provides_to_package.borrow_mut();
+        provides_map.entry(name_id).push(solvable);
+
+        solvable
+    }
+
+    /// Add a comps environment as a virtual solvable in the solver pool.
+    ///
+    /// Creates a solvable named `@{env_id}` (e.g. `@minimal-environment`)
+    /// whose Requires are the `@{group_id}` virtual solvables for the
+    /// environment's constituent groups. Mandatory groups (from `<grouplist>`)
+    /// are always included. Optional groups (from `<optionlist>`) are included
+    /// based on [`EnvironmentInstallOptions`]: by default, only those marked
+    /// `default="true"` in comps.xml are included.
+    ///
+    /// The virtual solvable uses version `1.0-1` and arch `noarch`. It can
+    /// be resolved like any other package by passing `@env-id` to
+    /// [`resolve()`](crate::resolve).
+    pub fn add_environment(
+        &mut self,
+        repo_id: usize,
+        env: &rpmrepo_metadata::CompsEnvironment,
+        options: &EnvironmentInstallOptions,
+    ) -> SolvableId {
+        let virtual_name = format!("@{}", env.id);
+        let name_id = self.pool.intern_package_name(&virtual_name);
+
+        let mut requires: Vec<VersionSetId> = Vec::new();
+
+        let any_version = |pool: &Pool<RpmRequirement>, group_id: &str| {
+            let gname = format!("@{}", group_id);
+            let gname_id = pool.intern_package_name(&gname);
+            let req = RpmRequirement {
+                flags: None,
+                epoch: None,
+                version: None,
+                release: None,
+                preinstall: false,
+            };
+            pool.intern_version_set(gname_id, req)
+        };
+
+        for group_id in &env.group_ids {
+            requires.push(any_version(&self.pool, group_id));
+        }
+
+        for opt in &env.option_ids {
+            if options.include_all_options || (options.include_default_options && opt.default) {
+                requires.push(any_version(&self.pool, &opt.group_id));
+            }
+        }
 
         let pack = RpmPackageVersion {
             name: virtual_name,

@@ -1,5 +1,6 @@
 use resolvo_rpm::{
-    ClosureOptions, LoadOptions, ResolveOptions, RpmProvider, UpdateRecord, resolve,
+    ClosureOptions, CompsGroup, GroupInstallOptions, LoadOptions, ResolveOptions, RpmProvider,
+    UpdateRecord, resolve,
 };
 use rpm_version::Evr;
 use std::{collections::BTreeSet, path::PathBuf, process};
@@ -36,6 +37,11 @@ enum Command {
         #[clap(long)]
         arch: Option<String>,
 
+        /// Include optional packages within groups. By default, only mandatory
+        /// and default packages are installed (matching dnf behavior).
+        #[clap(long)]
+        with_optional: bool,
+
         /// Disable Recommends. By default, recommended packages are installed
         /// if available (matching dnf behavior). This flag skips them entirely.
         #[clap(long)]
@@ -46,39 +52,10 @@ enum Command {
         #[clap(long)]
         enable_suggests: bool,
     },
-    /// Query the advisory (updateinfo) index.
-    ///
-    /// Lists advisories matching the given filters, or shows detail for a
-    /// single advisory when --id is given. Filters are combined with AND.
-    Query {
-        /// Paths to local repodata directories (must contain repodata/repomd.xml).
-        /// Can be specified multiple times.
-        #[clap(long, required = true)]
-        repo: Vec<PathBuf>,
-
-        /// Target architecture for filtering packages.
-        #[clap(long)]
-        arch: Option<String>,
-
-        /// Show full detail for a single advisory by ID.
-        #[clap(long)]
-        id: Option<String>,
-
-        /// Filter advisories by affected package name.
-        #[clap(long)]
-        package: Option<String>,
-
-        /// Filter advisories by CVE reference.
-        #[clap(long)]
-        cve: Option<String>,
-
-        /// Filter advisories by type (security, bugfix, enhancement).
-        #[clap(long = "type")]
-        advisory_type: Option<String>,
-
-        /// Filter advisories by severity (Critical, Important, Moderate, Low).
-        #[clap(long)]
-        severity: Option<String>,
+    /// List or inspect advisories (updateinfo/errata).
+    Advisory {
+        #[clap(subcommand)]
+        action: AdvisoryAction,
     },
     /// Check that all dependencies within the repos are satisfiable.
     Depclose {
@@ -102,6 +79,115 @@ enum Command {
         #[clap(long)]
         arch: Option<String>,
     },
+    /// List or inspect comps package groups.
+    Group {
+        #[clap(subcommand)]
+        action: GroupAction,
+    },
+    /// List or inspect comps environments.
+    Environment {
+        #[clap(subcommand)]
+        action: EnvironmentAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GroupAction {
+    /// List all available groups.
+    List {
+        /// Paths to local repodata directories.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture.
+        #[clap(long)]
+        arch: Option<String>,
+    },
+    /// Show details for a specific group.
+    Info {
+        /// Group ID or name.
+        spec: String,
+
+        /// Paths to local repodata directories.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture.
+        #[clap(long)]
+        arch: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdvisoryAction {
+    /// List advisories matching the given filters. Filters are combined with AND.
+    List {
+        /// Paths to local repodata directories (must contain repodata/repomd.xml).
+        /// Can be specified multiple times.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture for filtering packages.
+        #[clap(long)]
+        arch: Option<String>,
+
+        /// Filter advisories by affected package name.
+        #[clap(long)]
+        package: Option<String>,
+
+        /// Filter advisories by CVE reference.
+        #[clap(long)]
+        cve: Option<String>,
+
+        /// Filter advisories by type (security, bugfix, enhancement).
+        #[clap(long = "type")]
+        advisory_type: Option<String>,
+
+        /// Filter advisories by severity (Critical, Important, Moderate, Low).
+        #[clap(long)]
+        severity: Option<String>,
+    },
+    /// Show full detail for a single advisory by ID.
+    Info {
+        /// Advisory ID (e.g. RHSA-2024:1234).
+        id: String,
+
+        /// Paths to local repodata directories (must contain repodata/repomd.xml).
+        /// Can be specified multiple times.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture for filtering packages.
+        #[clap(long)]
+        arch: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnvironmentAction {
+    /// List all available environments.
+    List {
+        /// Paths to local repodata directories.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture.
+        #[clap(long)]
+        arch: Option<String>,
+    },
+    /// Show details for a specific environment.
+    Info {
+        /// Environment ID or name.
+        spec: String,
+
+        /// Paths to local repodata directories.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture.
+        #[clap(long)]
+        arch: Option<String>,
+    },
 }
 
 fn main() {
@@ -114,38 +200,53 @@ fn main() {
             repo,
             packages,
             arch,
+            with_optional,
             disable_recommends,
             enable_suggests,
         } => cmd_resolve(
             &repo,
             &packages,
             arch.as_deref(),
+            with_optional,
             disable_recommends,
             enable_suggests,
         ),
-        Command::Query {
-            repo,
-            arch,
-            id,
-            package,
-            cve,
-            advisory_type,
-            severity,
-        } => cmd_query(
-            &repo,
-            arch.as_deref(),
-            id.as_deref(),
-            package.as_deref(),
-            cve.as_deref(),
-            advisory_type.as_deref(),
-            severity.as_deref(),
-        ),
+        Command::Advisory { action } => match action {
+            AdvisoryAction::List {
+                repo,
+                arch,
+                package,
+                cve,
+                advisory_type,
+                severity,
+            } => cmd_advisory_list(
+                &repo,
+                arch.as_deref(),
+                package.as_deref(),
+                cve.as_deref(),
+                advisory_type.as_deref(),
+                severity.as_deref(),
+            ),
+            AdvisoryAction::Info { id, repo, arch } => {
+                cmd_advisory_info(&id, &repo, arch.as_deref())
+            }
+        },
         Command::Depclose {
             repo,
             check,
             newest,
             arch,
         } => cmd_depclose(&repo, &check, newest, arch.as_deref()),
+        Command::Group { action } => match action {
+            GroupAction::List { repo, arch } => cmd_group_list(&repo, arch.as_deref()),
+            GroupAction::Info { spec, repo, arch } => cmd_group_info(&spec, &repo, arch.as_deref()),
+        },
+        Command::Environment { action } => match action {
+            EnvironmentAction::List { repo, arch } => cmd_environment_list(&repo, arch.as_deref()),
+            EnvironmentAction::Info { spec, repo, arch } => {
+                cmd_environment_info(&spec, &repo, arch.as_deref())
+            }
+        },
     }
 }
 
@@ -157,15 +258,21 @@ fn cmd_resolve(
     repos: &[PathBuf],
     packages: &[String],
     arch: Option<&str>,
+    with_optional: bool,
     disable_recommends: bool,
     enable_suggests: bool,
 ) {
     let has_groups = packages.iter().any(|p| p.starts_with('@'));
     let has_advisories = packages.iter().any(|p| p.starts_with("patch:"));
 
-    let load_options = LoadOptions::new()
+    let mut load_options = LoadOptions::new()
         .load_groups(has_groups)
         .load_advisories(has_advisories);
+
+    if with_optional {
+        load_options =
+            load_options.group_options(GroupInstallOptions::new().include_optional(true));
+    }
 
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {
@@ -187,34 +294,25 @@ fn cmd_resolve(
     print_resolution(&solver, &solvables);
 }
 
-/// Query the advisory index, listing or showing detail for advisories.
-fn cmd_query(
-    repos: &[PathBuf],
-    arch: Option<&str>,
-    id: Option<&str>,
-    package: Option<&str>,
-    cve: Option<&str>,
-    advisory_type: Option<&str>,
-    severity: Option<&str>,
-) {
+fn load_advisory_provider(repos: &[PathBuf], arch: Option<&str>) -> RpmProvider {
     let load_options = LoadOptions::new().load_advisories(true);
-
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {
         let repo_label = &repo_path.display().to_string();
         provider.load_repo_with_options(repo_path, repo_label, &load_options);
     }
+    provider
+}
 
-    if let Some(advisory_id) = id {
-        match provider.advisory_by_id(advisory_id) {
-            Some(advisory) => print_advisory_detail(advisory),
-            None => {
-                eprintln!("Advisory not found: {}", advisory_id);
-                process::exit(1);
-            }
-        }
-        return;
-    }
+fn cmd_advisory_list(
+    repos: &[PathBuf],
+    arch: Option<&str>,
+    package: Option<&str>,
+    cve: Option<&str>,
+    advisory_type: Option<&str>,
+    severity: Option<&str>,
+) {
+    let provider = load_advisory_provider(repos, arch);
 
     let mut results: Vec<&UpdateRecord> = provider.advisories().iter().collect();
 
@@ -276,6 +374,18 @@ fn cmd_query(
     }
 
     eprintln!("\n{} advisories", results.len());
+}
+
+fn cmd_advisory_info(id: &str, repos: &[PathBuf], arch: Option<&str>) {
+    let provider = load_advisory_provider(repos, arch);
+
+    match provider.advisory_by_id(id) {
+        Some(advisory) => print_advisory_detail(advisory),
+        None => {
+            eprintln!("Advisory not found: {}", id);
+            process::exit(1);
+        }
+    }
 }
 
 /// Print full detail for a single advisory.
@@ -424,6 +534,129 @@ fn cmd_depclose(repos: &[PathBuf], check_repos: &[PathBuf], newest: bool, arch: 
 
     eprintln!("\n{} unsatisfied dependencies", problems.len());
     process::exit(1);
+}
+
+fn load_comps_provider(repos: &[PathBuf], arch: Option<&str>) -> RpmProvider {
+    let load_options = LoadOptions::new().load_groups(true);
+    let mut provider = RpmProvider::new(arch);
+    for repo_path in repos {
+        let repo_label = &repo_path.display().to_string();
+        provider.load_repo_with_options(repo_path, repo_label, &load_options);
+    }
+    provider
+}
+
+fn cmd_group_list(repos: &[PathBuf], arch: Option<&str>) {
+    let provider = load_comps_provider(repos, arch);
+    let mut groups: Vec<&CompsGroup> = provider.groups().iter().collect();
+    groups.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if groups.is_empty() {
+        eprintln!("No groups found.");
+        return;
+    }
+
+    let id_width = groups.iter().map(|g| g.id.len()).max().unwrap_or(0);
+    for group in &groups {
+        println!("{:<w$}  {}", group.id, group.name, w = id_width);
+    }
+    eprintln!("\n{} groups", groups.len());
+}
+
+fn cmd_group_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
+    let provider = load_comps_provider(repos, arch);
+    let group = provider
+        .groups()
+        .iter()
+        .find(|g| g.id == spec || g.name == spec);
+
+    let group = match group {
+        Some(g) => g,
+        None => {
+            eprintln!("Group not found: {}", spec);
+            process::exit(1);
+        }
+    };
+
+    println!("ID:          {}", group.id);
+    println!("Name:        {}", group.name);
+    if !group.description.is_empty() {
+        println!("Description: {}", group.description);
+    }
+
+    let types = ["mandatory", "default", "optional", "conditional"];
+    for reqtype in &types {
+        let pkgs: Vec<&str> = group
+            .packages
+            .iter()
+            .filter(|p| p.reqtype == *reqtype)
+            .map(|p| p.name.as_str())
+            .collect();
+        if pkgs.is_empty() {
+            continue;
+        }
+        println!("\n{}:", reqtype);
+        for pkg in &pkgs {
+            println!("  {}", pkg);
+        }
+    }
+}
+
+fn cmd_environment_list(repos: &[PathBuf], arch: Option<&str>) {
+    let provider = load_comps_provider(repos, arch);
+    let mut envs: Vec<_> = provider.environments().iter().collect();
+    envs.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if envs.is_empty() {
+        eprintln!("No environments found.");
+        return;
+    }
+
+    let id_width = envs.iter().map(|e| e.id.len()).max().unwrap_or(0);
+    for env in &envs {
+        println!("{:<w$}  {}", env.id, env.name, w = id_width);
+    }
+    eprintln!("\n{} environments", envs.len());
+}
+
+fn cmd_environment_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
+    let provider = load_comps_provider(repos, arch);
+    let env = provider
+        .environments()
+        .iter()
+        .find(|e| e.id == spec || e.name == spec);
+
+    let env = match env {
+        Some(e) => e,
+        None => {
+            eprintln!("Environment not found: {}", spec);
+            process::exit(1);
+        }
+    };
+
+    println!("ID:          {}", env.id);
+    println!("Name:        {}", env.name);
+    if !env.description.is_empty() {
+        println!("Description: {}", env.description);
+    }
+
+    if !env.group_ids.is_empty() {
+        println!("\nmandatory groups:");
+        for gid in &env.group_ids {
+            println!("  {}", gid);
+        }
+    }
+
+    if !env.option_ids.is_empty() {
+        println!("\noptional groups:");
+        for opt in &env.option_ids {
+            if opt.default {
+                println!("  {} [default]", opt.group_id);
+            } else {
+                println!("  {}", opt.group_id);
+            }
+        }
+    }
 }
 
 /// Print the resolved packages in alphabetical order, aligned in columns,
