@@ -274,11 +274,7 @@ fn cmd_resolve(
             load_options.group_options(GroupInstallOptions::new().include_optional(true));
     }
 
-    let mut provider = RpmProvider::new(arch);
-    for repo_path in repos {
-        let repo_label = &repo_path.display().to_string();
-        provider.load_repo_with_options(repo_path, repo_label, &load_options);
-    }
+    let provider = load_provider(repos, arch, &load_options);
 
     let mut solver = resolvo::Solver::new(provider);
     let pkg_names: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
@@ -294,12 +290,11 @@ fn cmd_resolve(
     print_resolution(&solver, &solvables);
 }
 
-fn load_advisory_provider(repos: &[PathBuf], arch: Option<&str>) -> RpmProvider {
-    let load_options = LoadOptions::new().load_advisories(true);
+fn load_provider(repos: &[PathBuf], arch: Option<&str>, options: &LoadOptions) -> RpmProvider {
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {
         let repo_label = &repo_path.display().to_string();
-        provider.load_repo_with_options(repo_path, repo_label, &load_options);
+        provider.load_repo_with_options(repo_path, repo_label, options);
     }
     provider
 }
@@ -312,7 +307,7 @@ fn cmd_advisory_list(
     advisory_type: Option<&str>,
     severity: Option<&str>,
 ) {
-    let provider = load_advisory_provider(repos, arch);
+    let provider = load_provider(repos, arch, &LoadOptions::new().load_advisories(true));
 
     let mut results: Vec<&UpdateRecord> = provider.advisories().iter().collect();
 
@@ -347,17 +342,13 @@ fn cmd_advisory_list(
         return;
     }
 
-    let id_width = results.iter().map(|a| a.id.len()).max().unwrap_or(0);
-    let type_width = results
-        .iter()
-        .map(|a| a.update_type.len())
-        .max()
-        .unwrap_or(0);
-    let sev_width = results
-        .iter()
-        .map(|a| a.severity.as_deref().unwrap_or("").len())
-        .max()
-        .unwrap_or(0);
+    let id_width = column_width(results.iter().map(|a| a.id.len()));
+    let type_width = column_width(results.iter().map(|a| a.update_type.len()));
+    let sev_width = column_width(
+        results
+            .iter()
+            .map(|a| a.severity.as_deref().unwrap_or("").len()),
+    );
 
     for advisory in &results {
         let sev = advisory.severity.as_deref().unwrap_or("");
@@ -377,15 +368,12 @@ fn cmd_advisory_list(
 }
 
 fn cmd_advisory_info(id: &str, repos: &[PathBuf], arch: Option<&str>) {
-    let provider = load_advisory_provider(repos, arch);
-
-    match provider.advisory_by_id(id) {
-        Some(advisory) => print_advisory_detail(advisory),
-        None => {
-            eprintln!("Advisory not found: {}", id);
-            process::exit(1);
-        }
-    }
+    let provider = load_provider(repos, arch, &LoadOptions::new().load_advisories(true));
+    let advisory = unwrap_or_exit(
+        provider.advisory_by_id(id),
+        &format!("Advisory not found: {}", id),
+    );
+    print_advisory_detail(advisory);
 }
 
 /// Print full detail for a single advisory.
@@ -408,11 +396,7 @@ fn print_advisory_detail(advisory: &UpdateRecord) {
         .collect();
     if !cve_refs.is_empty() {
         println!("\nReferences:");
-        let id_width = cve_refs
-            .iter()
-            .map(|r| r.id.as_deref().unwrap_or("").len())
-            .max()
-            .unwrap_or(0);
+        let id_width = column_width(cve_refs.iter().map(|r| r.id.as_deref().unwrap_or("").len()));
         for r in &cve_refs {
             let ref_id = r.id.as_deref().unwrap_or("");
             println!("  {:<w$}  {}", ref_id, r.href, w = id_width);
@@ -422,12 +406,12 @@ fn print_advisory_detail(advisory: &UpdateRecord) {
     let packages: Vec<_> = advisory.pkglist.iter().flat_map(|c| &c.packages).collect();
     if !packages.is_empty() {
         println!("\nPackages:");
-        let name_width = packages.iter().map(|p| p.name.len()).max().unwrap_or(0);
+        let name_width = column_width(packages.iter().map(|p| p.name.len()));
         let evrs: Vec<String> = packages
             .iter()
             .map(|p| Evr::new(&p.epoch, &p.version, &p.release).to_string())
             .collect();
-        let evr_width = evrs.iter().map(|e| e.len()).max().unwrap_or(0);
+        let evr_width = column_width(evrs.iter().map(|e| e.len()));
         for (p, evr) in packages.iter().zip(&evrs) {
             println!(
                 "  {:<nw$}  {:<ew$}  {}",
@@ -457,11 +441,7 @@ fn print_advisory_detail(advisory: &UpdateRecord) {
 /// Prints unsatisfied deps to stdout as an aligned table, sorted by
 /// package name. Exits with status 1 if any are found.
 fn cmd_depclose(repos: &[PathBuf], check_repos: &[PathBuf], newest: bool, arch: Option<&str>) {
-    let mut provider = RpmProvider::new(arch);
-    for repo_path in repos {
-        let repo_label = &repo_path.display().to_string();
-        provider.load_repo(repo_path, repo_label);
-    }
+    let provider = load_provider(repos, arch, &LoadOptions::new());
 
     // Map --check paths to repo_ids by matching against the --repo list.
     let check_repo_ids: Vec<usize> = check_repos
@@ -510,16 +490,8 @@ fn cmd_depclose(repos: &[PathBuf], check_repos: &[PathBuf], newest: bool, arch: 
         problems.insert((pkg_name.to_string(), pkg_version, req_display));
     }
 
-    let pkg_width = problems
-        .iter()
-        .map(|(name, _, _)| name.len())
-        .max()
-        .unwrap_or(0);
-    let ver_width = problems
-        .iter()
-        .map(|(_, ver, _)| ver.len())
-        .max()
-        .unwrap_or(0);
+    let pkg_width = column_width(problems.iter().map(|(name, _, _)| name.len()));
+    let ver_width = column_width(problems.iter().map(|(_, ver, _)| ver.len()));
 
     for (pkg, ver, req) in &problems {
         println!(
@@ -536,18 +508,8 @@ fn cmd_depclose(repos: &[PathBuf], check_repos: &[PathBuf], newest: bool, arch: 
     process::exit(1);
 }
 
-fn load_comps_provider(repos: &[PathBuf], arch: Option<&str>) -> RpmProvider {
-    let load_options = LoadOptions::new().load_groups(true);
-    let mut provider = RpmProvider::new(arch);
-    for repo_path in repos {
-        let repo_label = &repo_path.display().to_string();
-        provider.load_repo_with_options(repo_path, repo_label, &load_options);
-    }
-    provider
-}
-
 fn cmd_group_list(repos: &[PathBuf], arch: Option<&str>) {
-    let provider = load_comps_provider(repos, arch);
+    let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
     let mut groups: Vec<&CompsGroup> = provider.groups().iter().collect();
     groups.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -556,7 +518,7 @@ fn cmd_group_list(repos: &[PathBuf], arch: Option<&str>) {
         return;
     }
 
-    let id_width = groups.iter().map(|g| g.id.len()).max().unwrap_or(0);
+    let id_width = column_width(groups.iter().map(|g| g.id.len()));
     for group in &groups {
         println!("{:<w$}  {}", group.id, group.name, w = id_width);
     }
@@ -564,25 +526,16 @@ fn cmd_group_list(repos: &[PathBuf], arch: Option<&str>) {
 }
 
 fn cmd_group_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
-    let provider = load_comps_provider(repos, arch);
-    let group = provider
-        .groups()
-        .iter()
-        .find(|g| g.id == spec || g.name == spec);
+    let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
+    let group = unwrap_or_exit(
+        provider
+            .groups()
+            .iter()
+            .find(|g| g.id == spec || g.name == spec),
+        &format!("Group not found: {}", spec),
+    );
 
-    let group = match group {
-        Some(g) => g,
-        None => {
-            eprintln!("Group not found: {}", spec);
-            process::exit(1);
-        }
-    };
-
-    println!("ID:          {}", group.id);
-    println!("Name:        {}", group.name);
-    if !group.description.is_empty() {
-        println!("Description: {}", group.description);
-    }
+    print_header(&group.id, &group.name, &group.description);
 
     let types = ["mandatory", "default", "optional", "conditional"];
     for reqtype in &types {
@@ -603,7 +556,7 @@ fn cmd_group_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
 }
 
 fn cmd_environment_list(repos: &[PathBuf], arch: Option<&str>) {
-    let provider = load_comps_provider(repos, arch);
+    let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
     let mut envs: Vec<_> = provider.environments().iter().collect();
     envs.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -612,7 +565,7 @@ fn cmd_environment_list(repos: &[PathBuf], arch: Option<&str>) {
         return;
     }
 
-    let id_width = envs.iter().map(|e| e.id.len()).max().unwrap_or(0);
+    let id_width = column_width(envs.iter().map(|e| e.id.len()));
     for env in &envs {
         println!("{:<w$}  {}", env.id, env.name, w = id_width);
     }
@@ -620,25 +573,16 @@ fn cmd_environment_list(repos: &[PathBuf], arch: Option<&str>) {
 }
 
 fn cmd_environment_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
-    let provider = load_comps_provider(repos, arch);
-    let env = provider
-        .environments()
-        .iter()
-        .find(|e| e.id == spec || e.name == spec);
+    let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
+    let env = unwrap_or_exit(
+        provider
+            .environments()
+            .iter()
+            .find(|e| e.id == spec || e.name == spec),
+        &format!("Environment not found: {}", spec),
+    );
 
-    let env = match env {
-        Some(e) => e,
-        None => {
-            eprintln!("Environment not found: {}", spec);
-            process::exit(1);
-        }
-    };
-
-    println!("ID:          {}", env.id);
-    println!("Name:        {}", env.name);
-    if !env.description.is_empty() {
-        println!("Description: {}", env.description);
-    }
+    print_header(&env.id, &env.name, &env.description);
 
     if !env.group_ids.is_empty() {
         println!("\nmandatory groups:");
@@ -673,16 +617,8 @@ fn print_resolution(solver: &resolvo::Solver<RpmProvider>, solvables: &[resolvo:
         })
         .collect();
 
-    let name_width = resolved
-        .iter()
-        .map(|(name, _, _)| name.len())
-        .max()
-        .unwrap_or(0);
-    let ver_width = resolved
-        .iter()
-        .map(|(_, ver, _)| ver.len())
-        .max()
-        .unwrap_or(0);
+    let name_width = column_width(resolved.iter().map(|(name, _, _)| name.len()));
+    let ver_width = column_width(resolved.iter().map(|(_, ver, _)| ver.len()));
     for (name, version, repo) in &resolved {
         println!(
             "{:<nw$}  {:<vw$}  [{}]",
@@ -695,6 +631,28 @@ fn print_resolution(solver: &resolvo::Solver<RpmProvider>, solvables: &[resolvo:
     }
 
     eprintln!("\n{} packages resolved", resolved.len());
+}
+
+fn column_width(widths: impl Iterator<Item = usize>) -> usize {
+    widths.max().unwrap_or(0)
+}
+
+fn unwrap_or_exit<T>(option: Option<T>, message: &str) -> T {
+    match option {
+        Some(v) => v,
+        None => {
+            eprintln!("{}", message);
+            process::exit(1);
+        }
+    }
+}
+
+fn print_header(id: &str, name: &str, description: &str) {
+    println!("ID:          {}", id);
+    println!("Name:        {}", name);
+    if !description.is_empty() {
+        println!("Description: {}", description);
+    }
 }
 
 /// Print the solver error to stderr and exit with status 1.

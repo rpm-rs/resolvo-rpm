@@ -93,6 +93,23 @@ impl RpmPackageVersion {
             self.release.as_str(),
         )
     }
+
+    /// Construct a virtual package solvable record with version `0:1.0-1.noarch`.
+    ///
+    /// Used for groups (`@core`), environments (`@minimal-environment`), and
+    /// advisories (`patch:RHSA-2024:1234`). Callers override individual fields
+    /// (e.g. `requires`, `conflicts`, `version`) after construction.
+    pub(crate) fn virtual_package(name: String, repo_id: usize) -> Self {
+        Self {
+            name,
+            repo_id,
+            epoch: "0".to_owned(),
+            version: "1.0".to_owned(),
+            release: "1".to_owned(),
+            arch: "noarch".to_owned(),
+            ..Default::default()
+        }
+    }
 }
 
 /// A version-set type for RPM requirements, stored in the resolvo [`Pool`].
@@ -167,36 +184,9 @@ impl Display for RpmPackageVersion {
     }
 }
 
-/// Test whether a candidate's EVR satisfies a requirement's version constraint.
-///
-/// Returns `true` if the constraint is satisfied, or if no flags/version are
-/// specified (an unversioned requirement matches any version).
-fn check_version_constraint(
-    flags: Option<RequirementType>,
-    req_epoch: Option<&str>,
-    req_version: Option<&str>,
-    req_release: Option<&str>,
-    cand_epoch: &str,
-    cand_version: &str,
-    cand_release: &str,
-) -> bool {
-    let flags = match flags {
-        Some(f) => f,
-        None => return true,
-    };
-    let req_version = match req_version {
-        Some(v) => v,
-        None => return true,
-    };
-
-    let req_evr = Evr::new(
-        req_epoch.unwrap_or(""),
-        req_version,
-        req_release.unwrap_or(""),
-    );
-    let cand_evr = Evr::new(cand_epoch, cand_version, cand_release);
-
-    let ord = cand_evr.cmp(&req_evr);
+/// Test whether a candidate EVR satisfies a version constraint.
+fn check_version_constraint(flags: RequirementType, req: &Evr<'_>, candidate: &Evr<'_>) -> bool {
+    let ord = candidate.cmp(req);
     match flags {
         RequirementType::EQ => ord == Ordering::Equal,
         RequirementType::LT => ord == Ordering::Less,
@@ -502,30 +492,37 @@ impl RpmProvider {
     /// Otherwise, the package's own EVR is used.
     fn version_set_contains(&self, version_set: VersionSetId, solvable: SolvableId) -> bool {
         let vs = self.pool.resolve_version_set(version_set);
-        let record = &self.pool.resolve_solvable(solvable).record;
 
+        let flags = match vs.flags {
+            Some(f) => f,
+            None => return true,
+        };
+        let req_version = match vs.version {
+            Some(id) => self.pool.resolve_string(id),
+            None => return true,
+        };
+
+        let record = &self.pool.resolve_solvable(solvable).record;
         let capability_name_id = self.pool.resolve_version_set_package_name(version_set);
 
-        let (cand_epoch, cand_version, cand_release) =
-            if let Some(pv) = self.provides_versions.get(&(solvable, capability_name_id)) {
-                (pv.epoch.as_str(), pv.version.as_str(), pv.release.as_str())
-            } else {
-                (
-                    record.epoch.as_str(),
-                    record.version.as_str(),
-                    record.release.as_str(),
-                )
-            };
+        let cand_evr = if let Some(pv) = self.provides_versions.get(&(solvable, capability_name_id))
+        {
+            Evr::new(&pv.epoch, &pv.version, &pv.release)
+        } else {
+            record.evr()
+        };
 
-        check_version_constraint(
-            vs.flags,
-            vs.epoch.map(|id| self.pool.resolve_string(id)),
-            vs.version.map(|id| self.pool.resolve_string(id)),
-            vs.release.map(|id| self.pool.resolve_string(id)),
-            cand_epoch,
-            cand_version,
-            cand_release,
-        )
+        let req_evr = Evr::new(
+            vs.epoch
+                .map(|id| self.pool.resolve_string(id))
+                .unwrap_or(""),
+            req_version,
+            vs.release
+                .map(|id| self.pool.resolve_string(id))
+                .unwrap_or(""),
+        );
+
+        check_version_constraint(flags, &req_evr, &cand_evr)
     }
 }
 

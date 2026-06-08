@@ -133,6 +133,24 @@ fn intern_inverted_requirement(
     pool.intern_version_set(name_id, req)
 }
 
+/// Intern an unversioned requirement (matches any version of the named package).
+///
+/// Used when building virtual solvables for groups and environments, where
+/// the dependency is on the package name with no version constraint.
+fn intern_any_version(pool: &Pool<RpmRequirement>, name: &str) -> VersionSetId {
+    let name_id = pool.intern_package_name(name);
+    pool.intern_version_set(
+        name_id,
+        RpmRequirement {
+            flags: None,
+            epoch: None,
+            version: None,
+            release: None,
+            preinstall: false,
+        },
+    )
+}
+
 /// Visitor that streams primary.xml and populates the resolvo pool.
 ///
 /// As the XML parser encounters each `<package>` element, the visitor
@@ -920,6 +938,17 @@ impl RpmProvider {
         solvable
     }
 
+    /// Intern a solvable in the pool and register it in the provides map under
+    /// its own name. Returns the new `SolvableId`.
+    fn register_solvable(&self, name_id: NameId, pack: RpmPackageVersion) -> SolvableId {
+        let solvable = self.pool.intern_solvable(name_id, pack);
+        self.provides_to_package
+            .borrow_mut()
+            .entry(name_id)
+            .push(solvable);
+        solvable
+    }
+
     /// Add a package group as a virtual solvable in the solver pool.
     ///
     /// Creates a solvable named `@{group_id}` (e.g. `@core`) whose Requires
@@ -955,41 +984,13 @@ impl RpmProvider {
                         _ => false,
                     }
             })
-            .map(|p| {
-                let pkg_name_id = self.pool.intern_package_name(&p.name);
-                let req = RpmRequirement {
-                    flags: None,
-                    epoch: None,
-                    version: None,
-                    release: None,
-                    preinstall: false,
-                };
-                self.pool.intern_version_set(pkg_name_id, req)
-            })
+            .map(|p| intern_any_version(&self.pool, &p.name))
             .collect();
 
-        let pack = RpmPackageVersion {
-            name: virtual_name,
-            epoch: "0".to_owned(),
-            version: "1.0".to_owned(),
-            release: "1".to_owned(),
-            arch: "noarch".to_owned(),
-            repo_id,
-            requires,
-            conflicts: Vec::new(),
-            obsoletes: Vec::new(),
-            recommends: Vec::new(),
-            suggests: Vec::new(),
-            supplements: Vec::new(),
-            enhances: Vec::new(),
-        };
+        let mut pack = RpmPackageVersion::virtual_package(virtual_name, repo_id);
+        pack.requires = requires;
 
-        let solvable = self.pool.intern_solvable(name_id, pack);
-
-        let mut provides_map = self.provides_to_package.borrow_mut();
-        provides_map.entry(name_id).push(solvable);
-
-        solvable
+        self.register_solvable(name_id, pack)
     }
 
     /// Add a comps environment as a virtual solvable in the solver pool.
@@ -1015,51 +1016,22 @@ impl RpmProvider {
 
         let mut requires: Vec<VersionSetId> = Vec::new();
 
-        let any_version = |pool: &Pool<RpmRequirement>, group_id: &str| {
-            let gname = format!("@{}", group_id);
-            let gname_id = pool.intern_package_name(&gname);
-            let req = RpmRequirement {
-                flags: None,
-                epoch: None,
-                version: None,
-                release: None,
-                preinstall: false,
-            };
-            pool.intern_version_set(gname_id, req)
-        };
-
         for group_id in &env.group_ids {
-            requires.push(any_version(&self.pool, group_id));
+            let gname = format!("@{}", group_id);
+            requires.push(intern_any_version(&self.pool, &gname));
         }
 
         for opt in &env.option_ids {
             if options.include_all_options || (options.include_default_options && opt.default) {
-                requires.push(any_version(&self.pool, &opt.group_id));
+                let gname = format!("@{}", opt.group_id);
+                requires.push(intern_any_version(&self.pool, &gname));
             }
         }
 
-        let pack = RpmPackageVersion {
-            name: virtual_name,
-            epoch: "0".to_owned(),
-            version: "1.0".to_owned(),
-            release: "1".to_owned(),
-            arch: "noarch".to_owned(),
-            repo_id,
-            requires,
-            conflicts: Vec::new(),
-            obsoletes: Vec::new(),
-            recommends: Vec::new(),
-            suggests: Vec::new(),
-            supplements: Vec::new(),
-            enhances: Vec::new(),
-        };
+        let mut pack = RpmPackageVersion::virtual_package(virtual_name, repo_id);
+        pack.requires = requires;
 
-        let solvable = self.pool.intern_solvable(name_id, pack);
-
-        let mut provides_map = self.provides_to_package.borrow_mut();
-        provides_map.entry(name_id).push(solvable);
-
-        solvable
+        self.register_solvable(name_id, pack)
     }
 
     /// Add an advisory as a virtual solvable and index it for queries.
@@ -1140,27 +1112,11 @@ impl RpmProvider {
             &advisory.version
         };
 
-        let pack = RpmPackageVersion {
-            name: virtual_name,
-            epoch: "0".to_owned(),
-            version: advisory_version.to_owned(),
-            release: "1".to_owned(),
-            arch: "noarch".to_owned(),
-            repo_id,
-            requires: Vec::new(),
-            conflicts,
-            obsoletes: Vec::new(),
-            recommends: Vec::new(),
-            suggests: Vec::new(),
-            supplements: Vec::new(),
-            enhances: Vec::new(),
-        };
+        let mut pack = RpmPackageVersion::virtual_package(virtual_name, repo_id);
+        pack.version = advisory_version.to_owned();
+        pack.conflicts = conflicts;
 
-        let solvable = self.pool.intern_solvable(name_id, pack);
-
-        let mut provides_map = self.provides_to_package.borrow_mut();
-        provides_map.entry(name_id).push(solvable);
-        drop(provides_map);
+        let solvable = self.register_solvable(name_id, pack);
 
         // Populate the advisory index.
         let idx = self.advisories.len();
