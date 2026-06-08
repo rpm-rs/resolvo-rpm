@@ -2,7 +2,9 @@ use std::path::Path;
 
 use resolvo::utils::Pool;
 use rpmrepo_metadata::FileType;
-use rpmrepo_metadata::visitor::{CompsVisitor, FilelistsVisitor, PrimaryVisitor, RequirementData};
+use rpmrepo_metadata::visitor::{
+    CompsVisitor, FilelistsVisitor, PrimaryVisitor, RequirementData, UpdateinfoVisitor,
+};
 
 use crate::{
     GroupInstallOptions, HashMap, LoadOptions, PackageSpec, ProvidesMap, ProvidesVersion,
@@ -554,6 +556,99 @@ impl CompsVisitor for GroupLoaderVisitor<'_> {
     }
 }
 
+/// Accumulator for a single advisory's package entries during updateinfo.xml parsing.
+///
+/// As the XML parser encounters each `<update>` element, the visitor records
+/// the advisory ID and accumulates `(name, epoch, version, release, arch)`
+/// tuples for each package in the advisory's pkglist. On `end_update`, the
+/// completed advisory is pushed onto the output vec.
+struct AdvisoryInProgress {
+    id: String,
+    packages: Vec<(String, String, String, String, String)>,
+}
+
+/// Visitor that streams updateinfo.xml and collects advisory definitions.
+///
+/// Only the advisory ID and its per-package NEVRA tuples are retained —
+/// these are sufficient to generate the `patch:` virtual solvables with
+/// conflicts. Metadata fields (title, severity, references, etc.) are
+/// not needed for the solvable model and are ignored.
+struct UpdateinfoLoaderVisitor<'a> {
+    current: Option<AdvisoryInProgress>,
+    advisories: &'a mut Vec<rpmrepo_metadata::UpdateRecord>,
+    /// Temporary NEVRA for the current `<package>` element.
+    current_pkg: Option<(String, String, String, String, String)>,
+}
+
+impl UpdateinfoVisitor for UpdateinfoLoaderVisitor<'_> {
+    fn begin_update(&mut self, _from: &str, update_type: &str, _status: &str, _version: &str) {
+        self.current = Some(AdvisoryInProgress {
+            id: String::new(),
+            packages: Vec::new(),
+        });
+        // Stash update_type so we can set it on the UpdateRecord in end_update.
+        // We reuse the id field temporarily — it's overwritten by set_id.
+        if let Some(c) = &mut self.current {
+            c.id = update_type.to_owned();
+        }
+    }
+
+    fn set_id(&mut self, id: &str) {
+        if let Some(c) = &mut self.current {
+            c.id = id.to_owned();
+        }
+    }
+
+    fn begin_collection_package(
+        &mut self,
+        name: &str,
+        epoch: &str,
+        version: &str,
+        release: &str,
+        arch: &str,
+        _src: Option<&str>,
+    ) {
+        self.current_pkg = Some((
+            name.to_owned(),
+            epoch.to_owned(),
+            version.to_owned(),
+            release.to_owned(),
+            arch.to_owned(),
+        ));
+    }
+
+    fn end_collection_package(&mut self) {
+        if let (Some(c), Some(pkg)) = (&mut self.current, self.current_pkg.take()) {
+            c.packages.push(pkg);
+        }
+    }
+
+    fn end_update(&mut self) {
+        if let Some(c) = self.current.take() {
+            let mut record = rpmrepo_metadata::UpdateRecord::default();
+            record.id = c.id;
+            record.pkglist = vec![rpmrepo_metadata::UpdateCollection {
+                packages: c
+                    .packages
+                    .into_iter()
+                    .map(|(name, epoch, version, release, arch)| {
+                        rpmrepo_metadata::UpdateCollectionPackage {
+                            name,
+                            epoch,
+                            version,
+                            release,
+                            arch,
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            }];
+            self.advisories.push(record);
+        }
+    }
+}
+
 impl RpmProvider {
     /// Load RPM repository metadata from a local directory with default options.
     ///
@@ -629,6 +724,26 @@ impl RpmProvider {
 
                 for group in &groups {
                     self.add_group(repo_id, group, &options.group_options);
+                }
+            }
+        }
+
+        if options.load_advisories {
+            if let Some(updateinfo_record) = repomd.get_record("updateinfo") {
+                let updateinfo_path = path.join(&updateinfo_record.location_href);
+                let mut xml_reader =
+                    rpmrepo_metadata::utils::xml_reader_from_file(&updateinfo_path).unwrap();
+
+                let mut advisories: Vec<rpmrepo_metadata::UpdateRecord> = Vec::new();
+                let mut visitor = UpdateinfoLoaderVisitor {
+                    current: None,
+                    advisories: &mut advisories,
+                    current_pkg: None,
+                };
+                rpmrepo_metadata::visitor::parse_updateinfo(&mut xml_reader, &mut visitor).unwrap();
+
+                for advisory in &advisories {
+                    self.add_advisory(repo_id, advisory);
                 }
             }
         }
@@ -791,6 +906,95 @@ impl RpmProvider {
             repo_id,
             requires,
             conflicts: Vec::new(),
+            obsoletes: Vec::new(),
+            recommends: Vec::new(),
+            suggests: Vec::new(),
+            supplements: Vec::new(),
+            enhances: Vec::new(),
+        };
+
+        let solvable = self.pool.intern_solvable(name_id, pack);
+
+        let mut provides_map = self.provides_to_package.borrow_mut();
+        provides_map.entry(name_id).push(solvable);
+
+        solvable
+    }
+
+    /// Add an advisory as a virtual solvable in the solver pool.
+    ///
+    /// Creates a solvable named `patch:{advisory_id}` (e.g. `patch:RHSA-2024:1234`)
+    /// following libsolv's convention. For each package in the advisory's pkglist,
+    /// a constrains entry `name >= epoch:version-release` is generated. This means
+    /// resolving the patch solvable forces the solver to upgrade all affected
+    /// packages past the fixed version. Source-arch entries are skipped.
+    ///
+    /// Unlike libsolv, which generates arch-qualified constraints (e.g.
+    /// `name.x86_64 >= evr`), we use bare package names because our provides
+    /// map indexes by unqualified name and arch filtering happens at load time.
+    /// This is safe because RPM builds produce identical EVRs across all arches
+    /// from the same SRPM.
+    ///
+    /// The virtual solvable uses arch `noarch` and the advisory's `version`
+    /// field (defaulting to `"0"`) as its EVR.
+    pub fn add_advisory(
+        &mut self,
+        repo_id: usize,
+        advisory: &rpmrepo_metadata::UpdateRecord,
+    ) -> SolvableId {
+        let virtual_name = format!("patch:{}", advisory.id);
+        let name_id = self.pool.intern_package_name(&virtual_name);
+
+        let mut conflicts: Vec<VersionSetId> = Vec::new();
+
+        for collection in &advisory.pkglist {
+            for pkg in &collection.packages {
+                if pkg.name.is_empty() || pkg.arch == "src" {
+                    continue;
+                }
+
+                let epoch_str = if pkg.epoch.is_empty() {
+                    "0"
+                } else {
+                    &pkg.epoch
+                };
+
+                // Constrains: name >= epoch:version-release
+                //
+                // resolvo's constrains means "the selected version must
+                // satisfy this version set". GE ensures only versions at
+                // or above the advisory's fix are eligible.
+                let pkg_name_id = self.pool.intern_package_name(&pkg.name);
+                let req = RpmRequirement {
+                    flags: Some(RequirementType::GE),
+                    epoch: Some(self.pool.intern_string(epoch_str)),
+                    version: Some(self.pool.intern_string(&pkg.version)),
+                    release: if pkg.release.is_empty() {
+                        None
+                    } else {
+                        Some(self.pool.intern_string(&pkg.release))
+                    },
+                    preinstall: false,
+                };
+                conflicts.push(self.pool.intern_version_set(pkg_name_id, req));
+            }
+        }
+
+        let advisory_version = if advisory.version.is_empty() {
+            "0"
+        } else {
+            &advisory.version
+        };
+
+        let pack = RpmPackageVersion {
+            name: virtual_name,
+            epoch: "0".to_owned(),
+            version: advisory_version.to_owned(),
+            release: "1".to_owned(),
+            arch: "noarch".to_owned(),
+            repo_id,
+            requires: Vec::new(),
+            conflicts,
             obsoletes: Vec::new(),
             recommends: Vec::new(),
             suggests: Vec::new(),

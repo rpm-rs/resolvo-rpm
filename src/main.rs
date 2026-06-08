@@ -22,8 +22,9 @@ enum Command {
         #[clap(long, required = true)]
         repo: Vec<PathBuf>,
 
-        /// Package names or @group-ids to resolve dependencies for.
+        /// Package names, @group-ids, or patch:ADVISORY-IDs to resolve.
         /// Group names must be prefixed with @ (e.g. @core, @development).
+        /// Advisory IDs must be prefixed with patch: (e.g. patch:RHSA-2024:1234).
         #[clap(required = true)]
         packages: Vec<String>,
 
@@ -106,8 +107,11 @@ fn cmd_resolve(
     enable_suggests: bool,
 ) {
     let has_groups = packages.iter().any(|p| p.starts_with('@'));
+    let has_advisories = packages.iter().any(|p| p.starts_with("patch:"));
 
-    let load_options = LoadOptions::new().load_groups(has_groups);
+    let load_options = LoadOptions::new()
+        .load_groups(has_groups)
+        .load_advisories(has_advisories);
 
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {

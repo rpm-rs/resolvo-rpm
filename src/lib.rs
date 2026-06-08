@@ -31,7 +31,10 @@ use resolvo::{
 };
 use rpm_version::Evr;
 pub use rpmrepo_metadata::RequirementType;
-pub use rpmrepo_metadata::{CompsGroup, CompsPackageReq};
+pub use rpmrepo_metadata::{
+    CompsGroup, CompsPackageReq, UpdateCollection, UpdateCollectionPackage, UpdateRecord,
+    UpdateReference,
+};
 use std::{cell::RefCell, cmp::Ordering, fmt::Display, hash::Hash, path::PathBuf};
 
 type HashMap<K, V> = ahash::AHashMap<K, V>;
@@ -507,6 +510,7 @@ pub struct LoadOptions {
     pub(crate) load_filelists: bool,
     pub(crate) load_groups: bool,
     pub(crate) group_options: GroupInstallOptions,
+    pub(crate) load_advisories: bool,
 }
 
 impl LoadOptions {
@@ -544,6 +548,19 @@ impl LoadOptions {
         self.group_options = options;
         self
     }
+
+    /// Set whether updateinfo.xml (advisory/errata metadata) should be parsed
+    /// during [`RpmProvider::load_repo()`].
+    ///
+    /// When true, advisories are loaded and registered as virtual solvables
+    /// named `patch:ADVISORY-ID`. Each advisory solvable conflicts with
+    /// pre-fix versions of affected packages, so resolving a patch forces the
+    /// solver to upgrade those packages past the fixed version.
+    /// When false (the default), advisory metadata is ignored.
+    pub fn load_advisories(mut self, load: bool) -> Self {
+        self.load_advisories = load;
+        self
+    }
 }
 
 impl Default for LoadOptions {
@@ -552,6 +569,7 @@ impl Default for LoadOptions {
             load_filelists: false,
             load_groups: false,
             group_options: GroupInstallOptions::default(),
+            load_advisories: false,
         }
     }
 }
