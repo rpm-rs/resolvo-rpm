@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use resolvo_rpm::{
-    DependencySpec, LoadOptions, PackageSpec, ResolveOptions, RpmProvider,
-    UpdateCollection, UpdateCollectionPackage, UpdateRecord, resolve,
+    DependencySpec, LoadOptions, PackageSpec, ResolveOptions, RpmProvider, UpdateCollection,
+    UpdateCollectionPackage, UpdateRecord, UpdateReference, resolve,
 };
 
 mod common;
@@ -140,9 +140,7 @@ fn add_advisory_forces_upgrade() {
         .collect();
 
     assert!(
-        resolved
-            .iter()
-            .any(|(n, _)| n == "patch:RHSA-2024:0001"),
+        resolved.iter().any(|(n, _)| n == "patch:RHSA-2024:0001"),
         "the advisory virtual solvable should be in the result"
     );
     assert!(
@@ -402,9 +400,7 @@ fn advisory_cascades_through_deps() {
         .collect();
 
     assert!(
-        resolved
-            .iter()
-            .any(|(n, _)| n == "app"),
+        resolved.iter().any(|(n, _)| n == "app"),
         "app should be in the result"
     );
     assert!(
@@ -445,9 +441,10 @@ fn load_advisories_from_repo() {
     );
 
     // RHSA-2023:2523 (openssl security advisory) should be among them
-    let has_openssl_advisory = provider.pool.iter_solvables().any(|(sid, _)| {
-        provider.package_name(sid) == "patch:RHSA-2023:2523"
-    });
+    let has_openssl_advisory = provider
+        .pool
+        .iter_solvables()
+        .any(|(sid, _)| provider.package_name(sid) == "patch:RHSA-2023:2523");
 
     assert!(
         has_openssl_advisory,
@@ -485,17 +482,19 @@ fn mixed_advisory_and_package_resolution() {
 
     add_package(&mut provider, repo, "secure-lib", "0", "1.0", "1", "x86_64");
     add_package(&mut provider, repo, "secure-lib", "0", "2.0", "1", "x86_64");
-    add_package(&mut provider, repo, "unrelated-pkg", "0", "1.0", "1", "x86_64");
+    add_package(
+        &mut provider,
+        repo,
+        "unrelated-pkg",
+        "0",
+        "1.0",
+        "1",
+        "x86_64",
+    );
 
     let advisory = make_advisory(
         "RHSA-2024:9999",
-        vec![make_advisory_pkg(
-            "secure-lib",
-            "0",
-            "2.0",
-            "1",
-            "x86_64",
-        )],
+        vec![make_advisory_pkg("secure-lib", "0", "2.0", "1", "x86_64")],
     );
     provider.add_advisory(repo, &advisory);
 
@@ -515,4 +514,191 @@ fn mixed_advisory_and_package_resolution() {
     assert!(names.contains("patch:RHSA-2024:9999"));
     assert!(names.contains("secure-lib"));
     assert!(names.contains("unrelated-pkg"));
+}
+
+// --- Advisory index / query tests ---
+
+/// Manually added advisories should be queryable by ID.
+#[test]
+fn advisory_index_by_id() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_package(&mut provider, repo, "foo", "0", "1.0", "1", "x86_64");
+    add_package(&mut provider, repo, "foo", "0", "2.0", "1", "x86_64");
+
+    let advisory = make_advisory(
+        "RHSA-2024:1111",
+        vec![make_advisory_pkg("foo", "0", "2.0", "1", "x86_64")],
+    );
+    provider.add_advisory(repo, &advisory);
+
+    let result = provider.advisory_by_id("RHSA-2024:1111");
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().id, "RHSA-2024:1111");
+    assert_eq!(result.unwrap().update_type, "security");
+
+    assert!(provider.advisory_by_id("RHSA-9999:0000").is_none());
+}
+
+/// Advisories should be queryable by affected package name.
+#[test]
+fn advisory_index_by_package() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_package(&mut provider, repo, "alpha", "0", "1.0", "1", "x86_64");
+    add_package(&mut provider, repo, "beta", "0", "1.0", "1", "x86_64");
+
+    let advisory1 = make_advisory(
+        "RHSA-2024:1001",
+        vec![make_advisory_pkg("alpha", "0", "2.0", "1", "x86_64")],
+    );
+    let advisory2 = make_advisory(
+        "RHSA-2024:1002",
+        vec![
+            make_advisory_pkg("alpha", "0", "3.0", "1", "x86_64"),
+            make_advisory_pkg("beta", "0", "2.0", "1", "x86_64"),
+        ],
+    );
+    provider.add_advisory(repo, &advisory1);
+    provider.add_advisory(repo, &advisory2);
+
+    let alpha_advisories = provider.advisories_for_package("alpha");
+    assert_eq!(alpha_advisories.len(), 2);
+
+    let beta_advisories = provider.advisories_for_package("beta");
+    assert_eq!(beta_advisories.len(), 1);
+    assert_eq!(beta_advisories[0].id, "RHSA-2024:1002");
+
+    assert!(provider.advisories_for_package("gamma").is_empty());
+}
+
+/// Advisories should be queryable by CVE reference.
+#[test]
+fn advisory_index_by_cve() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_package(&mut provider, repo, "foo", "0", "1.0", "1", "x86_64");
+
+    let mut advisory = make_advisory(
+        "RHSA-2024:2001",
+        vec![make_advisory_pkg("foo", "0", "2.0", "1", "x86_64")],
+    );
+    advisory.references = vec![
+        UpdateReference {
+            href: "https://access.redhat.com/security/cve/CVE-2024-0001".to_owned(),
+            id: Some("CVE-2024-0001".to_owned()),
+            reftype: "cve".to_owned(),
+            title: "CVE-2024-0001".to_owned(),
+        },
+        UpdateReference {
+            href: "https://bugzilla.redhat.com/1234".to_owned(),
+            id: Some("1234".to_owned()),
+            reftype: "bugzilla".to_owned(),
+            title: "some bug".to_owned(),
+        },
+    ];
+    provider.add_advisory(repo, &advisory);
+
+    let by_cve = provider.advisories_by_cve("CVE-2024-0001");
+    assert_eq!(by_cve.len(), 1);
+    assert_eq!(by_cve[0].id, "RHSA-2024:2001");
+
+    // Bugzilla refs should not appear in CVE index
+    assert!(provider.advisories_by_cve("1234").is_empty());
+    assert!(provider.advisories_by_cve("CVE-9999-0000").is_empty());
+}
+
+/// Advisories should be filterable by type.
+#[test]
+fn advisory_index_by_type() {
+    let mut provider = RpmProvider::new(None);
+    let repo = provider.add_repo("test");
+
+    add_package(&mut provider, repo, "foo", "0", "1.0", "1", "x86_64");
+
+    let mut sec_advisory = make_advisory(
+        "RHSA-2024:3001",
+        vec![make_advisory_pkg("foo", "0", "2.0", "1", "x86_64")],
+    );
+    sec_advisory.update_type = "security".to_owned();
+
+    let mut bug_advisory = make_advisory(
+        "RHBA-2024:3002",
+        vec![make_advisory_pkg("foo", "0", "3.0", "1", "x86_64")],
+    );
+    bug_advisory.update_type = "bugfix".to_owned();
+
+    provider.add_advisory(repo, &sec_advisory);
+    provider.add_advisory(repo, &bug_advisory);
+
+    let security = provider.advisories_by_type("security");
+    assert_eq!(security.len(), 1);
+    assert_eq!(security[0].id, "RHSA-2024:3001");
+
+    let bugfix = provider.advisories_by_type("bugfix");
+    assert_eq!(bugfix.len(), 1);
+    assert_eq!(bugfix[0].id, "RHBA-2024:3002");
+
+    assert!(provider.advisories_by_type("enhancement").is_empty());
+}
+
+/// Loading advisories from a real repo should populate the advisory index.
+#[test]
+fn advisory_index_from_repo() {
+    let load_options = LoadOptions::new().load_advisories(true);
+
+    let mut provider = RpmProvider::new(Some("x86_64"));
+    provider.load_repo_with_options(
+        &common::repo_path("el9-baseos"),
+        "el9-baseos",
+        &load_options,
+    );
+
+    assert!(
+        !provider.advisories().is_empty(),
+        "advisories vec should be populated"
+    );
+
+    // RHSA-2023:2523 is a security advisory for openssl
+    let advisory = provider.advisory_by_id("RHSA-2023:2523");
+    assert!(advisory.is_some(), "RHSA-2023:2523 should be in the index");
+    let advisory = advisory.unwrap();
+    assert_eq!(advisory.update_type, "security");
+    assert_eq!(advisory.severity, Some("Low".to_owned()));
+    assert_eq!(advisory.title, "Low: openssl security and bug fix update");
+
+    // Should be findable by package name
+    let openssl_advisories = provider.advisories_for_package("openssl");
+    assert!(
+        openssl_advisories.iter().any(|a| a.id == "RHSA-2023:2523"),
+        "openssl should be referenced by RHSA-2023:2523"
+    );
+
+    // Should be findable by CVE
+    let cve_advisories = provider.advisories_by_cve("CVE-2022-3358");
+    assert!(
+        cve_advisories.iter().any(|a| a.id == "RHSA-2023:2523"),
+        "CVE-2022-3358 should map to RHSA-2023:2523"
+    );
+
+    // Should be filterable by type
+    let security = provider.advisories_by_type("security");
+    assert!(
+        security.iter().any(|a| a.id == "RHSA-2023:2523"),
+        "security filter should include RHSA-2023:2523"
+    );
+}
+
+/// Advisory index should be empty when load_advisories is false.
+#[test]
+fn advisory_index_not_loaded_by_default() {
+    let mut provider = RpmProvider::new(Some("x86_64"));
+    provider.load_repo(&common::repo_path("el9-baseos"), "el9-baseos");
+
+    assert!(provider.advisories().is_empty());
+    assert!(provider.advisory_by_id("RHSA-2023:2523").is_none());
+    assert!(provider.advisories_for_package("openssl").is_empty());
 }

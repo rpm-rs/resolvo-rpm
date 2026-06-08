@@ -556,46 +556,60 @@ impl CompsVisitor for GroupLoaderVisitor<'_> {
     }
 }
 
-/// Accumulator for a single advisory's package entries during updateinfo.xml parsing.
-///
-/// As the XML parser encounters each `<update>` element, the visitor records
-/// the advisory ID and accumulates `(name, epoch, version, release, arch)`
-/// tuples for each package in the advisory's pkglist. On `end_update`, the
-/// completed advisory is pushed onto the output vec.
-struct AdvisoryInProgress {
-    id: String,
-    packages: Vec<(String, String, String, String, String)>,
-}
-
-/// Visitor that streams updateinfo.xml and collects advisory definitions.
-///
-/// Only the advisory ID and its per-package NEVRA tuples are retained —
-/// these are sufficient to generate the `patch:` virtual solvables with
-/// conflicts. Metadata fields (title, severity, references, etc.) are
-/// not needed for the solvable model and are ignored.
+/// Visitor that streams updateinfo.xml and collects advisory records.
 struct UpdateinfoLoaderVisitor<'a> {
-    current: Option<AdvisoryInProgress>,
+    current: Option<rpmrepo_metadata::UpdateRecord>,
     advisories: &'a mut Vec<rpmrepo_metadata::UpdateRecord>,
-    /// Temporary NEVRA for the current `<package>` element.
-    current_pkg: Option<(String, String, String, String, String)>,
+    current_collection: Option<rpmrepo_metadata::UpdateCollection>,
+    current_pkg: Option<rpmrepo_metadata::UpdateCollectionPackage>,
 }
 
 impl UpdateinfoVisitor for UpdateinfoLoaderVisitor<'_> {
-    fn begin_update(&mut self, _from: &str, update_type: &str, _status: &str, _version: &str) {
-        self.current = Some(AdvisoryInProgress {
-            id: String::new(),
-            packages: Vec::new(),
-        });
-        // Stash update_type so we can set it on the UpdateRecord in end_update.
-        // We reuse the id field temporarily — it's overwritten by set_id.
-        if let Some(c) = &mut self.current {
-            c.id = update_type.to_owned();
-        }
+    fn begin_update(&mut self, _from: &str, update_type: &str, _status: &str, version: &str) {
+        let mut rec = rpmrepo_metadata::UpdateRecord::default();
+        rec.update_type = update_type.to_owned();
+        rec.version = version.to_owned();
+        self.current = Some(rec);
     }
 
     fn set_id(&mut self, id: &str) {
         if let Some(c) = &mut self.current {
             c.id = id.to_owned();
+        }
+    }
+
+    fn set_title(&mut self, title: &str) {
+        if let Some(c) = &mut self.current {
+            c.title = title.to_owned();
+        }
+    }
+
+    fn set_severity(&mut self, severity: &str) {
+        if let Some(c) = &mut self.current {
+            c.severity = Some(severity.to_owned());
+        }
+    }
+
+    fn set_issued_date(&mut self, date: &str) {
+        if let Some(c) = &mut self.current {
+            c.issued_date = Some(date.to_owned());
+        }
+    }
+
+    fn set_updated_date(&mut self, date: &str) {
+        if let Some(c) = &mut self.current {
+            c.updated_date = Some(date.to_owned());
+        }
+    }
+
+    fn add_reference(&mut self, href: &str, id: Option<&str>, reftype: &str, title: &str) {
+        if let Some(c) = &mut self.current {
+            c.references.push(rpmrepo_metadata::UpdateReference {
+                href: href.to_owned(),
+                id: id.map(|s| s.to_owned()),
+                title: title.to_owned(),
+                reftype: reftype.to_owned(),
+            });
         }
     }
 
@@ -606,45 +620,35 @@ impl UpdateinfoVisitor for UpdateinfoLoaderVisitor<'_> {
         version: &str,
         release: &str,
         arch: &str,
-        _src: Option<&str>,
+        src: Option<&str>,
     ) {
-        self.current_pkg = Some((
-            name.to_owned(),
-            epoch.to_owned(),
-            version.to_owned(),
-            release.to_owned(),
-            arch.to_owned(),
-        ));
+        if self.current_collection.is_none() {
+            self.current_collection = Some(rpmrepo_metadata::UpdateCollection::default());
+        }
+        let mut pkg = rpmrepo_metadata::UpdateCollectionPackage::default();
+        pkg.name = name.to_owned();
+        pkg.epoch = epoch.to_owned();
+        pkg.version = version.to_owned();
+        pkg.release = release.to_owned();
+        pkg.arch = arch.to_owned();
+        pkg.src = src.map(|s| s.to_owned());
+        self.current_pkg = Some(pkg);
     }
 
     fn end_collection_package(&mut self) {
-        if let (Some(c), Some(pkg)) = (&mut self.current, self.current_pkg.take()) {
-            c.packages.push(pkg);
+        if let (Some(collection), Some(pkg)) =
+            (&mut self.current_collection, self.current_pkg.take())
+        {
+            collection.packages.push(pkg);
         }
     }
 
     fn end_update(&mut self) {
-        if let Some(c) = self.current.take() {
-            let mut record = rpmrepo_metadata::UpdateRecord::default();
-            record.id = c.id;
-            record.pkglist = vec![rpmrepo_metadata::UpdateCollection {
-                packages: c
-                    .packages
-                    .into_iter()
-                    .map(|(name, epoch, version, release, arch)| {
-                        rpmrepo_metadata::UpdateCollectionPackage {
-                            name,
-                            epoch,
-                            version,
-                            release,
-                            arch,
-                            ..Default::default()
-                        }
-                    })
-                    .collect(),
-                ..Default::default()
-            }];
-            self.advisories.push(record);
+        if let Some(mut rec) = self.current.take() {
+            if let Some(collection) = self.current_collection.take() {
+                rec.pkglist.push(collection);
+            }
+            self.advisories.push(rec);
         }
     }
 }
@@ -738,6 +742,7 @@ impl RpmProvider {
                 let mut visitor = UpdateinfoLoaderVisitor {
                     current: None,
                     advisories: &mut advisories,
+                    current_collection: None,
                     current_pkg: None,
                 };
                 rpmrepo_metadata::visitor::parse_updateinfo(&mut xml_reader, &mut visitor).unwrap();
@@ -921,7 +926,7 @@ impl RpmProvider {
         solvable
     }
 
-    /// Add an advisory as a virtual solvable in the solver pool.
+    /// Add an advisory as a virtual solvable and index it for queries.
     ///
     /// Creates a solvable named `patch:{advisory_id}` (e.g. `patch:RHSA-2024:1234`)
     /// following libsolv's convention. For each package in the advisory's pkglist,
@@ -935,13 +940,26 @@ impl RpmProvider {
     /// This is safe because RPM builds produce identical EVRs across all arches
     /// from the same SRPM.
     ///
-    /// The virtual solvable uses arch `noarch` and the advisory's `version`
-    /// field (defaulting to `"0"`) as its EVR.
+    /// The advisory metadata is also stored in the advisory index, making it
+    /// queryable via [`advisory_by_id()`](Self::advisory_by_id),
+    /// [`advisories_for_package()`](Self::advisories_for_package), etc.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an advisory with the same ID has already been added.
+    /// Duplicate advisory IDs (e.g. one per arch) are known to occur in the
+    /// wild but merging them is not yet implemented.
     pub fn add_advisory(
         &mut self,
         repo_id: usize,
         advisory: &rpmrepo_metadata::UpdateRecord,
     ) -> SolvableId {
+        assert!(
+            !self.advisory_id_to_index.contains_key(&advisory.id),
+            "duplicate advisory ID: {}",
+            advisory.id
+        );
+
         let virtual_name = format!("patch:{}", advisory.id);
         let name_id = self.pool.intern_package_name(&virtual_name);
 
@@ -1006,6 +1024,32 @@ impl RpmProvider {
 
         let mut provides_map = self.provides_to_package.borrow_mut();
         provides_map.entry(name_id).push(solvable);
+        drop(provides_map);
+
+        // Populate the advisory index.
+        let idx = self.advisories.len();
+        self.advisory_id_to_index.insert(advisory.id.clone(), idx);
+        for collection in &advisory.pkglist {
+            for pkg in &collection.packages {
+                if !pkg.name.is_empty() && pkg.arch != "src" {
+                    self.advisory_pkg_index
+                        .entry(pkg.name.clone())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+        }
+        for r in &advisory.references {
+            if r.reftype == "cve" {
+                if let Some(cve_id) = &r.id {
+                    self.advisory_cve_index
+                        .entry(cve_id.clone())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+        }
+        self.advisories.push(advisory.clone());
 
         solvable
     }

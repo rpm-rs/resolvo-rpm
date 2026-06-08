@@ -267,6 +267,14 @@ pub struct RpmProvider {
     target_arch: Option<String>,
     filelists_paths: Vec<PathBuf>,
     filelists_loaded: RefCell<bool>,
+    /// All loaded advisories, in insertion order.
+    advisories: Vec<UpdateRecord>,
+    /// Maps advisory ID (e.g. "RHSA-2024:1234") to its index in `advisories`.
+    advisory_id_to_index: HashMap<String, usize>,
+    /// Maps package name to the indices of advisories that reference it.
+    advisory_pkg_index: HashMap<String, Vec<usize>>,
+    /// Maps CVE ID to the indices of advisories that reference it.
+    advisory_cve_index: HashMap<String, Vec<usize>>,
 }
 
 impl RpmProvider {
@@ -286,6 +294,10 @@ impl RpmProvider {
             target_arch: target_arch.map(|s| s.to_string()),
             filelists_paths: Vec::new(),
             filelists_loaded: RefCell::new(false),
+            advisories: Vec::new(),
+            advisory_id_to_index: HashMap::new(),
+            advisory_pkg_index: HashMap::new(),
+            advisory_cve_index: HashMap::new(),
         }
     }
 
@@ -429,6 +441,42 @@ impl RpmProvider {
     pub fn repo_label(&self, solvable: SolvableId) -> &str {
         let record = &self.pool.resolve_solvable(solvable).record;
         &self.repo_labels[record.repo_id]
+    }
+
+    /// Return all loaded advisories.
+    pub fn advisories(&self) -> &[UpdateRecord] {
+        &self.advisories
+    }
+
+    /// Look up an advisory by its ID (e.g. "RHSA-2024:1234").
+    pub fn advisory_by_id(&self, id: &str) -> Option<&UpdateRecord> {
+        self.advisory_id_to_index
+            .get(id)
+            .map(|&idx| &self.advisories[idx])
+    }
+
+    /// Return all advisories that reference the given package name.
+    pub fn advisories_for_package(&self, name: &str) -> Vec<&UpdateRecord> {
+        self.advisory_pkg_index
+            .get(name)
+            .map(|indices| indices.iter().map(|&i| &self.advisories[i]).collect())
+            .unwrap_or_default()
+    }
+
+    /// Return all advisories of the given type (e.g. "security", "bugfix", "enhancement").
+    pub fn advisories_by_type(&self, update_type: &str) -> Vec<&UpdateRecord> {
+        self.advisories
+            .iter()
+            .filter(|a| a.update_type == update_type)
+            .collect()
+    }
+
+    /// Return all advisories that reference the given CVE ID (e.g. "CVE-2024-1234").
+    pub fn advisories_by_cve(&self, cve_id: &str) -> Vec<&UpdateRecord> {
+        self.advisory_cve_index
+            .get(cve_id)
+            .map(|indices| indices.iter().map(|&i| &self.advisories[i]).collect())
+            .unwrap_or_default()
     }
 
     /// Check whether a solvable satisfies a version set (requirement).
