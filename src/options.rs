@@ -9,7 +9,7 @@
 ///
 /// let opts = LoadOptions::new().load_filelists(true).load_groups(true);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
     pub(crate) load_filelists: bool,
     pub(crate) load_groups: bool,
@@ -74,18 +74,6 @@ impl LoadOptions {
     pub fn load_advisories(mut self, load: bool) -> Self {
         self.load_advisories = load;
         self
-    }
-}
-
-impl Default for LoadOptions {
-    fn default() -> Self {
-        Self {
-            load_filelists: false,
-            load_groups: false,
-            group_options: GroupInstallOptions::default(),
-            environment_options: EnvironmentInstallOptions::default(),
-            load_advisories: false,
-        }
     }
 }
 

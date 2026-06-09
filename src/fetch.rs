@@ -64,6 +64,12 @@ pub struct FetchConfig {
     pub all: bool,
 }
 
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FetchConfig {
     pub fn new() -> Self {
         Self {

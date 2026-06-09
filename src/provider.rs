@@ -460,6 +460,49 @@ impl RpmProvider {
         &self.environments
     }
 
+    /// Find all solvables that provide the given capability.
+    ///
+    /// The capability can be a package name, a virtual provide (e.g.
+    /// `python(abi)`), or a file path (e.g. `/usr/bin/python3`). File paths
+    /// trigger lazy loading of filelists.xml.
+    pub fn whatprovides(&self, capability: &str) -> Vec<SolvableId> {
+        if capability.starts_with('/') {
+            self.load_filelists();
+        }
+
+        let name_id = match self.pool.lookup_package_name(&capability.to_string()) {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+
+        let provides_map = self.provides_to_package.borrow();
+        provides_map.get(name_id).cloned().unwrap_or_default()
+    }
+
+    /// Find all solvables that require the given capability.
+    ///
+    /// Scans every solvable's Requires list and returns those that have at
+    /// least one requirement matching the given capability name.
+    pub fn whatrequires(&self, capability: &str) -> Vec<SolvableId> {
+        let name_id = match self.pool.lookup_package_name(&capability.to_string()) {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+        for (sid, solvable) in self.pool.iter_solvables() {
+            let record = &solvable.record;
+            let has_dep = record
+                .requires
+                .iter()
+                .any(|&vs_id| self.pool.resolve_version_set_package_name(vs_id) == name_id);
+            if has_dep {
+                result.push(sid);
+            }
+        }
+        result
+    }
+
     /// Check whether a solvable satisfies a version set (requirement).
     ///
     /// If the solvable has an explicit provides version for the capability

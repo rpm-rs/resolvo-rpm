@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use resolvo::utils::Pool;
-use rpmrepo_metadata::{FileType, MetadataError};
 use rpmrepo_metadata::visitor::{
     CompsVisitor, FilelistsVisitor, PrimaryVisitor, RequirementData, UpdateinfoVisitor,
 };
+use rpmrepo_metadata::{FileType, MetadataError};
 
 use crate::{
     EnvironmentInstallOptions, GroupInstallOptions, HashMap, LoadOptions, PackageSpec, ProvidesMap,
@@ -200,11 +200,12 @@ impl PrimaryVisitor for PrimaryLoaderVisitor<'_> {
     fn begin_package(&mut self, name: &str, arch: &str, _checksum_type: &str, _pkgid: &str) {
         self.pkg.reset();
 
-        if let Some(target) = self.target_arch {
-            if arch != target && arch != "noarch" {
-                self.skip = true;
-                return;
-            }
+        if let Some(target) = self.target_arch
+            && arch != target
+            && arch != "noarch"
+        {
+            self.skip = true;
+            return;
         }
         self.skip = false;
 
@@ -642,9 +643,11 @@ struct UpdateinfoLoaderVisitor<'a> {
 
 impl UpdateinfoVisitor for UpdateinfoLoaderVisitor<'_> {
     fn begin_update(&mut self, _from: &str, update_type: &str, _status: &str, version: &str) {
-        let mut rec = rpmrepo_metadata::UpdateRecord::default();
-        rec.update_type = update_type.to_owned();
-        rec.version = version.to_owned();
+        let rec = rpmrepo_metadata::UpdateRecord {
+            update_type: update_type.to_owned(),
+            version: version.to_owned(),
+            ..Default::default()
+        };
         self.current = Some(rec);
     }
 
@@ -701,13 +704,15 @@ impl UpdateinfoVisitor for UpdateinfoLoaderVisitor<'_> {
         if self.current_collection.is_none() {
             self.current_collection = Some(rpmrepo_metadata::UpdateCollection::default());
         }
-        let mut pkg = rpmrepo_metadata::UpdateCollectionPackage::default();
-        pkg.name = name.to_owned();
-        pkg.epoch = epoch.to_owned();
-        pkg.version = version.to_owned();
-        pkg.release = release.to_owned();
-        pkg.arch = arch.to_owned();
-        pkg.src = src.map(|s| s.to_owned());
+        let pkg = rpmrepo_metadata::UpdateCollectionPackage {
+            name: name.to_owned(),
+            epoch: epoch.to_owned(),
+            version: version.to_owned(),
+            release: release.to_owned(),
+            arch: arch.to_owned(),
+            src: src.map(|s| s.to_owned()),
+            ..Default::default()
+        };
         self.current_pkg = Some(pkg);
     }
 
@@ -797,51 +802,49 @@ impl RpmProvider {
         // Must drop the provides_map borrow before add_group takes &mut self.
         drop(provides_map);
 
-        if options.load_groups {
-            if let Some(group_record) = repomd.get_record("group") {
-                let group_path = path.join(&group_record.location_href);
-                let mut xml_reader =
-                    rpmrepo_metadata::utils::xml_reader_from_file(&group_path)?;
+        if options.load_groups
+            && let Some(group_record) = repomd.get_record("group")
+        {
+            let group_path = path.join(&group_record.location_href);
+            let mut xml_reader = rpmrepo_metadata::utils::xml_reader_from_file(&group_path)?;
 
-                let mut groups: Vec<rpmrepo_metadata::CompsGroup> = Vec::new();
-                let mut environments: Vec<rpmrepo_metadata::CompsEnvironment> = Vec::new();
-                let mut visitor = CompsLoaderVisitor {
-                    current_group: None,
-                    groups: &mut groups,
-                    current_environment: None,
-                    environments: &mut environments,
-                };
-                rpmrepo_metadata::visitor::parse_comps(&mut xml_reader, &mut visitor)?;
+            let mut groups: Vec<rpmrepo_metadata::CompsGroup> = Vec::new();
+            let mut environments: Vec<rpmrepo_metadata::CompsEnvironment> = Vec::new();
+            let mut visitor = CompsLoaderVisitor {
+                current_group: None,
+                groups: &mut groups,
+                current_environment: None,
+                environments: &mut environments,
+            };
+            rpmrepo_metadata::visitor::parse_comps(&mut xml_reader, &mut visitor)?;
 
-                for group in &groups {
-                    self.add_group(repo_id, group, &options.group_options);
-                }
-                for env in &environments {
-                    self.add_environment(repo_id, env, &options.environment_options);
-                }
-                self.groups.extend(groups);
-                self.environments.extend(environments);
+            for group in &groups {
+                self.add_group(repo_id, group, &options.group_options);
             }
+            for env in &environments {
+                self.add_environment(repo_id, env, &options.environment_options);
+            }
+            self.groups.extend(groups);
+            self.environments.extend(environments);
         }
 
-        if options.load_advisories {
-            if let Some(updateinfo_record) = repomd.get_record("updateinfo") {
-                let updateinfo_path = path.join(&updateinfo_record.location_href);
-                let mut xml_reader =
-                    rpmrepo_metadata::utils::xml_reader_from_file(&updateinfo_path)?;
+        if options.load_advisories
+            && let Some(updateinfo_record) = repomd.get_record("updateinfo")
+        {
+            let updateinfo_path = path.join(&updateinfo_record.location_href);
+            let mut xml_reader = rpmrepo_metadata::utils::xml_reader_from_file(&updateinfo_path)?;
 
-                let mut advisories: Vec<rpmrepo_metadata::UpdateRecord> = Vec::new();
-                let mut visitor = UpdateinfoLoaderVisitor {
-                    current: None,
-                    advisories: &mut advisories,
-                    current_collection: None,
-                    current_pkg: None,
-                };
-                rpmrepo_metadata::visitor::parse_updateinfo(&mut xml_reader, &mut visitor)?;
+            let mut advisories: Vec<rpmrepo_metadata::UpdateRecord> = Vec::new();
+            let mut visitor = UpdateinfoLoaderVisitor {
+                current: None,
+                advisories: &mut advisories,
+                current_collection: None,
+                current_pkg: None,
+            };
+            rpmrepo_metadata::visitor::parse_updateinfo(&mut xml_reader, &mut visitor)?;
 
-                for advisory in &advisories {
-                    self.add_advisory(repo_id, advisory);
-                }
+            for advisory in &advisories {
+                self.add_advisory(repo_id, advisory);
             }
         }
 
@@ -1142,13 +1145,13 @@ impl RpmProvider {
             }
         }
         for r in &advisory.references {
-            if r.reftype == "cve" {
-                if let Some(cve_id) = &r.id {
-                    self.advisory_cve_index
-                        .entry(cve_id.clone())
-                        .or_default()
-                        .push(idx);
-                }
+            if r.reftype == "cve"
+                && let Some(cve_id) = &r.id
+            {
+                self.advisory_cve_index
+                    .entry(cve_id.clone())
+                    .or_default()
+                    .push(idx);
             }
         }
         self.advisories.push(advisory.clone());

@@ -1,3 +1,4 @@
+use resolvo::SolvableId;
 use resolvo_rpm::fetch::{FetchConfig, fetch_repodata};
 use resolvo_rpm::{
     ClosureOptions, CompsGroup, GroupInstallOptions, LoadOptions, ResolveOptions, RpmProvider,
@@ -134,6 +135,11 @@ enum Command {
         #[clap(subcommand)]
         action: EnvironmentAction,
     },
+    /// Query packages by their provides or requires.
+    Repoquery {
+        #[clap(subcommand)]
+        action: RepoqueryAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -203,6 +209,40 @@ enum AdvisoryAction {
         repo: Vec<PathBuf>,
 
         /// Target architecture for filtering packages.
+        #[clap(long)]
+        arch: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoqueryAction {
+    /// Find packages that provide the given capability.
+    ///
+    /// The capability can be a package name, a virtual provide (e.g.
+    /// python(abi)), or a file path (e.g. /usr/bin/python3). File paths
+    /// trigger loading of filelists.xml for complete results.
+    Whatprovides {
+        /// Capability name or file path to search for.
+        capability: String,
+
+        /// Paths to local repodata directories.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture.
+        #[clap(long)]
+        arch: Option<String>,
+    },
+    /// Find packages that require the given capability.
+    Whatrequires {
+        /// Capability name to search for.
+        capability: String,
+
+        /// Paths to local repodata directories.
+        #[clap(long, required = true)]
+        repo: Vec<PathBuf>,
+
+        /// Target architecture.
         #[clap(long)]
         arch: Option<String>,
     },
@@ -323,6 +363,18 @@ fn main() {
                 cmd_environment_info(&spec, &repo, arch.as_deref())
             }
         },
+        Command::Repoquery { action } => match action {
+            RepoqueryAction::Whatprovides {
+                capability,
+                repo,
+                arch,
+            } => cmd_whatprovides(&capability, &repo, arch.as_deref()),
+            RepoqueryAction::Whatrequires {
+                capability,
+                repo,
+                arch,
+            } => cmd_whatrequires(&capability, &repo, arch.as_deref()),
+        },
     }
 }
 
@@ -366,6 +418,9 @@ fn cmd_resolve(
     print_resolution(&solver, &solvables);
 }
 
+/// Load an [`RpmProvider`] from one or more local repodata directories.
+///
+/// Exits with status 1 if any repo fails to load.
 fn load_provider(repos: &[PathBuf], arch: Option<&str>, options: &LoadOptions) -> RpmProvider {
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {
@@ -378,6 +433,9 @@ fn load_provider(repos: &[PathBuf], arch: Option<&str>, options: &LoadOptions) -
     provider
 }
 
+/// List advisories matching the given filters, printed as an aligned table.
+///
+/// Filters (package, CVE, type, severity) are combined with AND.
 fn cmd_advisory_list(
     repos: &[PathBuf],
     arch: Option<&str>,
@@ -446,6 +504,7 @@ fn cmd_advisory_list(
     eprintln!("\n{} advisories", results.len());
 }
 
+/// Print full detail for a single advisory, looked up by ID.
 fn cmd_advisory_info(id: &str, repos: &[PathBuf], arch: Option<&str>) {
     let provider = load_provider(repos, arch, &LoadOptions::new().load_advisories(true));
     let advisory = unwrap_or_exit(
@@ -587,6 +646,7 @@ fn cmd_depclose(repos: &[PathBuf], check_repos: &[PathBuf], newest: bool, arch: 
     process::exit(1);
 }
 
+/// List all comps groups as an aligned ID/name table.
 fn cmd_group_list(repos: &[PathBuf], arch: Option<&str>) {
     let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
     let mut groups: Vec<&CompsGroup> = provider.groups().iter().collect();
@@ -604,6 +664,7 @@ fn cmd_group_list(repos: &[PathBuf], arch: Option<&str>) {
     eprintln!("\n{} groups", groups.len());
 }
 
+/// Print detail for a single comps group, looked up by ID or name.
 fn cmd_group_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
     let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
     let group = unwrap_or_exit(
@@ -634,6 +695,7 @@ fn cmd_group_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
     }
 }
 
+/// List all comps environments as an aligned ID/name table.
 fn cmd_environment_list(repos: &[PathBuf], arch: Option<&str>) {
     let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
     let mut envs: Vec<_> = provider.environments().iter().collect();
@@ -651,6 +713,7 @@ fn cmd_environment_list(repos: &[PathBuf], arch: Option<&str>) {
     eprintln!("\n{} environments", envs.len());
 }
 
+/// Print detail for a single comps environment, looked up by ID or name.
 fn cmd_environment_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
     let provider = load_provider(repos, arch, &LoadOptions::new().load_groups(true));
     let env = unwrap_or_exit(
@@ -682,23 +745,50 @@ fn cmd_environment_info(spec: &str, repos: &[PathBuf], arch: Option<&str>) {
     }
 }
 
-/// Print the resolved packages in alphabetical order, aligned in columns,
-/// with repo labels and a total count on stderr.
-fn print_resolution(solver: &resolvo::Solver<RpmProvider>, solvables: &[resolvo::SolvableId]) {
-    let provider = solver.provider();
-    let resolved: BTreeSet<(String, String, &str)> = solvables
+/// Find and print all packages that provide the given capability.
+fn cmd_whatprovides(capability: &str, repos: &[PathBuf], arch: Option<&str>) {
+    let provider = load_provider(repos, arch, &LoadOptions::new());
+    let solvables = provider.whatprovides(capability);
+
+    if solvables.is_empty() {
+        eprintln!("No packages provide '{}'.", capability);
+        return;
+    }
+
+    let count = print_solvable_table(&provider, &solvables);
+    eprintln!("\n{} packages", count);
+}
+
+/// Find and print all packages that have a dependency on the given capability.
+fn cmd_whatrequires(capability: &str, repos: &[PathBuf], arch: Option<&str>) {
+    let provider = load_provider(repos, arch, &LoadOptions::new());
+    let solvables = provider.whatrequires(capability);
+
+    if solvables.is_empty() {
+        eprintln!("No packages require '{}'.", capability);
+        return;
+    }
+
+    let count = print_solvable_table(&provider, &solvables);
+    eprintln!("\n{} packages", count);
+}
+
+/// Print solvables as an aligned name/version/repo table, sorted and
+/// deduplicated. Returns the number of unique rows printed.
+fn print_solvable_table(provider: &RpmProvider, solvables: &[SolvableId]) -> usize {
+    let rows: BTreeSet<(String, String, &str)> = solvables
         .iter()
-        .map(|s| {
-            let name = provider.package_name(*s).to_string();
-            let version = provider.package_version(*s).to_string();
-            let repo = provider.repo_label(*s);
+        .map(|&s| {
+            let name = provider.package_name(s).to_string();
+            let version = provider.package_version(s).to_string();
+            let repo = provider.repo_label(s);
             (name, version, repo)
         })
         .collect();
 
-    let name_width = column_width(resolved.iter().map(|(name, _, _)| name.len()));
-    let ver_width = column_width(resolved.iter().map(|(_, ver, _)| ver.len()));
-    for (name, version, repo) in &resolved {
+    let name_width = column_width(rows.iter().map(|(name, _, _)| name.len()));
+    let ver_width = column_width(rows.iter().map(|(_, ver, _)| ver.len()));
+    for (name, version, repo) in &rows {
         println!(
             "{:<nw$}  {:<vw$}  [{}]",
             name,
@@ -708,14 +798,22 @@ fn print_resolution(solver: &resolvo::Solver<RpmProvider>, solvables: &[resolvo:
             vw = ver_width
         );
     }
-
-    eprintln!("\n{} packages resolved", resolved.len());
+    rows.len()
 }
 
+/// Print the resolved packages in alphabetical order, aligned in columns,
+/// with repo labels and a total count on stderr.
+fn print_resolution(solver: &resolvo::Solver<RpmProvider>, solvables: &[resolvo::SolvableId]) {
+    let count = print_solvable_table(solver.provider(), solvables);
+    eprintln!("\n{} packages resolved", count);
+}
+
+/// Return the maximum value in an iterator, for column-width calculation.
 fn column_width(widths: impl Iterator<Item = usize>) -> usize {
     widths.max().unwrap_or(0)
 }
 
+/// Unwrap an `Option`, or print a message to stderr and exit with status 1.
 fn unwrap_or_exit<T>(option: Option<T>, message: &str) -> T {
     match option {
         Some(v) => v,
@@ -726,6 +824,7 @@ fn unwrap_or_exit<T>(option: Option<T>, message: &str) -> T {
     }
 }
 
+/// Print a standard ID/Name/Description header block.
 fn print_header(id: &str, name: &str, description: &str) {
     println!("ID:          {}", id);
     println!("Name:        {}", name);
