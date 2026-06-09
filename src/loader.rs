@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use resolvo::utils::Pool;
-use rpmrepo_metadata::FileType;
+use rpmrepo_metadata::{FileType, MetadataError};
 use rpmrepo_metadata::visitor::{
     CompsVisitor, FilelistsVisitor, PrimaryVisitor, RequirementData, UpdateinfoVisitor,
 };
@@ -734,8 +734,8 @@ impl RpmProvider {
     ///
     /// Equivalent to calling [`load_repo_with_options`](Self::load_repo_with_options)
     /// with [`LoadOptions::default()`].
-    pub fn load_repo(&mut self, path: &Path, label: &str) {
-        self.load_repo_with_options(path, label, &LoadOptions::default());
+    pub fn load_repo(&mut self, path: &Path, label: &str) -> Result<(), MetadataError> {
+        self.load_repo_with_options(path, label, &LoadOptions::default())
     }
 
     /// Load RPM repository metadata from a local directory.
@@ -748,16 +748,24 @@ impl RpmProvider {
     /// When [`LoadOptions::load_filelists`] is true, filelists.xml is parsed
     /// immediately; otherwise it is deferred until a file dependency is
     /// encountered during resolution.
-    pub fn load_repo_with_options(&mut self, path: &Path, label: &str, options: &LoadOptions) {
+    pub fn load_repo_with_options(
+        &mut self,
+        path: &Path,
+        label: &str,
+        options: &LoadOptions,
+    ) -> Result<(), MetadataError> {
         let repo_id = self.repo_labels.len();
         self.repo_labels.push(label.to_string());
 
-        let repo_reader = rpmrepo_metadata::RepositoryReader::new_from_directory(path).unwrap();
+        let repo_reader = rpmrepo_metadata::RepositoryReader::new_from_directory(path)?;
         let repomd = repo_reader.repomd();
 
-        let primary_href = &repomd.get_record("primary").unwrap().location_href;
+        let primary_href = &repomd
+            .get_record("primary")
+            .ok_or(MetadataError::MissingFieldError("primary"))?
+            .location_href;
         let primary_path = path.join(primary_href);
-        let mut xml_reader = rpmrepo_metadata::utils::xml_reader_from_file(&primary_path).unwrap();
+        let mut xml_reader = rpmrepo_metadata::utils::xml_reader_from_file(&primary_path)?;
 
         let mut provides_map = self.provides_to_package.borrow_mut();
         let mut visitor = PrimaryLoaderVisitor::new(
@@ -768,19 +776,19 @@ impl RpmProvider {
             self.target_arch.as_deref(),
         );
 
-        rpmrepo_metadata::visitor::parse_primary(&mut xml_reader, &mut visitor).unwrap();
+        rpmrepo_metadata::visitor::parse_primary(&mut xml_reader, &mut visitor)?;
 
         if let Some(filelists_record) = repomd.get_record("filelists") {
             let filelists_path = path.join(&filelists_record.location_href);
             if options.load_filelists {
                 let mut xml_reader =
-                    rpmrepo_metadata::utils::xml_reader_from_file(&filelists_path).unwrap();
+                    rpmrepo_metadata::utils::xml_reader_from_file(&filelists_path)?;
                 let mut visitor = FilelistsLoaderVisitor {
                     pool: &self.pool,
                     provides_map: &mut provides_map,
                     current_solvables: Vec::new(),
                 };
-                rpmrepo_metadata::visitor::parse_filelists(&mut xml_reader, &mut visitor).unwrap();
+                rpmrepo_metadata::visitor::parse_filelists(&mut xml_reader, &mut visitor)?;
             } else {
                 self.filelists_paths.push(filelists_path);
             }
@@ -793,7 +801,7 @@ impl RpmProvider {
             if let Some(group_record) = repomd.get_record("group") {
                 let group_path = path.join(&group_record.location_href);
                 let mut xml_reader =
-                    rpmrepo_metadata::utils::xml_reader_from_file(&group_path).unwrap();
+                    rpmrepo_metadata::utils::xml_reader_from_file(&group_path)?;
 
                 let mut groups: Vec<rpmrepo_metadata::CompsGroup> = Vec::new();
                 let mut environments: Vec<rpmrepo_metadata::CompsEnvironment> = Vec::new();
@@ -803,7 +811,7 @@ impl RpmProvider {
                     current_environment: None,
                     environments: &mut environments,
                 };
-                rpmrepo_metadata::visitor::parse_comps(&mut xml_reader, &mut visitor).unwrap();
+                rpmrepo_metadata::visitor::parse_comps(&mut xml_reader, &mut visitor)?;
 
                 for group in &groups {
                     self.add_group(repo_id, group, &options.group_options);
@@ -820,7 +828,7 @@ impl RpmProvider {
             if let Some(updateinfo_record) = repomd.get_record("updateinfo") {
                 let updateinfo_path = path.join(&updateinfo_record.location_href);
                 let mut xml_reader =
-                    rpmrepo_metadata::utils::xml_reader_from_file(&updateinfo_path).unwrap();
+                    rpmrepo_metadata::utils::xml_reader_from_file(&updateinfo_path)?;
 
                 let mut advisories: Vec<rpmrepo_metadata::UpdateRecord> = Vec::new();
                 let mut visitor = UpdateinfoLoaderVisitor {
@@ -829,13 +837,15 @@ impl RpmProvider {
                     current_collection: None,
                     current_pkg: None,
                 };
-                rpmrepo_metadata::visitor::parse_updateinfo(&mut xml_reader, &mut visitor).unwrap();
+                rpmrepo_metadata::visitor::parse_updateinfo(&mut xml_reader, &mut visitor)?;
 
                 for advisory in &advisories {
                     self.add_advisory(repo_id, advisory);
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Register a named repository, returning its `repo_id` for use with
@@ -1145,6 +1155,13 @@ impl RpmProvider {
 
         solvable
     }
+
+    // TODO: the unwraps here should be replaced with proper error handling, but
+    // this is called from the `DependencyProvider::get_candidates` trait method
+    // which doesn't return `Result`, so errors can't propagate naturally.
+    //
+    // Options include storing the error in a `Cell` and checking after solving, or
+    // reworking the call site to load filelists eagerly before solving begins.
 
     /// Parse filelists.xml for all loaded repos and index every file path
     /// into the provides map. Called lazily on the first `get_candidates` miss

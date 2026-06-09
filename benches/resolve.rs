@@ -10,16 +10,16 @@ fn repo_path(name: &str) -> std::path::PathBuf {
 
 fn load_cs10_provider() -> RpmProvider {
     let mut provider = RpmProvider::new(Some("x86_64"));
-    provider.load_repo(&repo_path("cs10-baseos"), "cs10-baseos");
-    provider.load_repo(&repo_path("cs10-appstream"), "cs10-appstream");
+    provider.load_repo(&repo_path("cs10-baseos"), "cs10-baseos").unwrap();
+    provider.load_repo(&repo_path("cs10-appstream"), "cs10-appstream").unwrap();
     provider
 }
 
 fn load_cs10_provider_with_filelists() -> RpmProvider {
     let opts = LoadOptions::new().load_filelists(true);
     let mut provider = RpmProvider::new(Some("x86_64"));
-    provider.load_repo_with_options(&repo_path("cs10-baseos"), "cs10-baseos", &opts);
-    provider.load_repo_with_options(&repo_path("cs10-appstream"), "cs10-appstream", &opts);
+    provider.load_repo_with_options(&repo_path("cs10-baseos"), "cs10-baseos", &opts).unwrap();
+    provider.load_repo_with_options(&repo_path("cs10-appstream"), "cs10-appstream", &opts).unwrap();
     provider
 }
 

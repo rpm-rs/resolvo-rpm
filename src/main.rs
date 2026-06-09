@@ -370,7 +370,10 @@ fn load_provider(repos: &[PathBuf], arch: Option<&str>, options: &LoadOptions) -
     let mut provider = RpmProvider::new(arch);
     for repo_path in repos {
         let repo_label = &repo_path.display().to_string();
-        provider.load_repo_with_options(repo_path, repo_label, options);
+        if let Err(e) = provider.load_repo_with_options(repo_path, repo_label, options) {
+            eprintln!("Error loading repo {}: {}", repo_path.display(), e);
+            process::exit(1);
+        }
     }
     provider
 }
