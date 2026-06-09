@@ -1,9 +1,11 @@
+use resolvo_rpm::fetch::{FetchConfig, fetch_repodata};
 use resolvo_rpm::{
     ClosureOptions, CompsGroup, GroupInstallOptions, LoadOptions, ResolveOptions, RpmProvider,
     UpdateRecord, resolve,
 };
 use rpm_version::Evr;
 use std::{collections::BTreeSet, path::PathBuf, process};
+use url::Url;
 
 use clap::{Parser, Subcommand};
 
@@ -78,6 +80,49 @@ enum Command {
         /// will be considered. If omitted, all architectures are included.
         #[clap(long)]
         arch: Option<String>,
+    },
+    /// Download RPM repository metadata from a remote URL.
+    Fetch {
+        /// URL of the RPM repository (e.g. https://example.com/repo/).
+        url: String,
+
+        /// Local directory to store the downloaded repodata.
+        #[clap(long, default_value = ".")]
+        dest: PathBuf,
+
+        /// Authentication token appended as a URL query parameter.
+        #[clap(long)]
+        auth_token: Option<String>,
+
+        /// Trust environment variables for proxy configuration
+        /// (HTTP_PROXY, HTTPS_PROXY, etc.).
+        #[clap(long)]
+        allow_env_var: bool,
+
+        /// Custom User-Agent string.
+        #[clap(long)]
+        user_agent: Option<String>,
+
+        /// Disable TLS certificate verification.
+        #[clap(long)]
+        insecure: bool,
+
+        /// Path to a TLS client certificate (PEM format).
+        #[clap(long)]
+        tls_client_cert: Option<PathBuf>,
+
+        /// Path to a TLS client private key (PEM format).
+        #[clap(long)]
+        tls_client_key: Option<PathBuf>,
+
+        /// Path to a CA certificate bundle (PEM format).
+        #[clap(long)]
+        tls_ca_cert: Option<PathBuf>,
+
+        /// Download all metadata files listed in repomd.xml, not just the
+        /// standard set (primary, filelists, other, updateinfo, comps).
+        #[clap(long)]
+        all: bool,
     },
     /// List or inspect comps package groups.
     Group {
@@ -211,6 +256,37 @@ fn main() {
             disable_recommends,
             enable_suggests,
         ),
+        Command::Fetch {
+            url,
+            dest,
+            auth_token,
+            allow_env_var,
+            user_agent,
+            insecure,
+            tls_client_cert,
+            tls_client_key,
+            tls_ca_cert,
+            all,
+        } => {
+            let base_url = Url::parse(&url).unwrap_or_else(|e| {
+                eprintln!("Invalid URL: {}", e);
+                process::exit(1);
+            });
+            let config = FetchConfig {
+                auth_token,
+                allow_env_var,
+                user_agent,
+                verify_tls: !insecure,
+                tls_client_cert,
+                tls_client_key,
+                tls_ca_cert,
+                all,
+            };
+            if let Err(e) = fetch_repodata(base_url, &dest, &config) {
+                eprintln!("Error fetching repodata: {}", e);
+                process::exit(1);
+            }
+        }
         Command::Advisory { action } => match action {
             AdvisoryAction::List {
                 repo,
